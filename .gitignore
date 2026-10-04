@@ -1,0 +1,103 @@
+# ========================================================
+# PixKura - Git Ignore Configuration
+# ========================================================
+
+# --- Database Files (Contains personal local file paths and cached thumbnails) ---
+pixiv_artists.db*
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# --- Local Configurations & Sensitive Data (Do NOT commit personal cookies) ---
+config.json
+!config.json.example
+*.log
+error.log
+*.bak
+*.swp
+*.swo
+
+# --- Large AI Models & Weights (ONNX / PyTorch / Checkpoints / Tags) ---
+models/
+*.onnx
+*.onnx_data
+*.pth
+*.pt
+*.bin
+*.safetensors
+*.download
+*.part
+*.crdownload
+selected_tags.csv
+
+# --- Downloaded Artwork, Test Media & Temp Archives ---
+downloads/
+output/
+temp/
+tmp/
+*.tmp
+test_video.*
+test_output/
+*.mp4
+*.webm
+*.avi
+*.mkv
+*.zip
+*.ugoira
+*.tar
+*.gz
+*.7z
+
+# --- Python Virtual Environments ---
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# --- Python Cache & Testing ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+.cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Operating System Files ---
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+$RECYCLE.BIN/
+*.lnk
+
+# --- IDE, Editor & Agent Settings ---
+.vscode/
+.idea/
+.vs/
+.agents/
+.cursor/
+.gemini/
+.system_generated/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.code-workspace
+
+# --- Distribution & Packaging ---
+build/
+dist/
+*.spec
+*.exe
+*.dll
+*.egg-info/
