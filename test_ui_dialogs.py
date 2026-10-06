@@ -10,6 +10,9 @@ from database import get_dashboard_analytics
 from dashboard_dialog import DashboardDialog
 from lightbox_viewer import LightboxViewerDialog
 
+from unittest.mock import patch
+from utils import show_in_file_manager
+
 class TestUIDialogs(unittest.TestCase):
     def test_dashboard_analytics_query(self):
         if not os.path.exists(DB_FILE):
@@ -59,6 +62,37 @@ class TestUIDialogs(unittest.TestCase):
         # Select FIT mode
         dlg.combo_scale.setCurrentIndex(0)
         self.assertEqual(dlg.img_view.view_mode, "FIT")
+
+        # Test open_explorer on lightbox viewer
+        with patch("utils.subprocess.Popen") as mock_popen:
+            dlg.open_explorer()
+            if paths:
+                self.assertTrue(mock_popen.called)
+                self.assertEqual(dlg.btn_explorer.text(), "📂 Opening...")
+
+    def test_show_in_file_manager(self):
+        # Test non-existent path
+        self.assertFalse(show_in_file_manager(""))
+        self.assertFalse(show_in_file_manager("C:\\non_existent_folder_xyz\\file.jpg"))
+
+        # Test valid existing file with spaces
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            sp_dir = os.path.join(td, "folder with spaces")
+            os.makedirs(sp_dir, exist_ok=True)
+            sp_file = os.path.join(sp_dir, "test image.png")
+            with open(sp_file, "w") as f:
+                f.write("test")
+
+            with patch("subprocess.Popen") as mock_popen:
+                res = show_in_file_manager(sp_file)
+                self.assertTrue(res)
+                self.assertTrue(mock_popen.called)
+                called_cmd = mock_popen.call_args[0][0]
+                if sys.platform == 'win32':
+                    # Must have /select,"..." with quotes only around the file path
+                    self.assertIn('/select,"', called_cmd)
+                    self.assertFalse(called_cmd.startswith('explorer "/select,'))
 
     def test_zoomable_image_widget(self):
         from lightbox_viewer import ZoomableImageLabel

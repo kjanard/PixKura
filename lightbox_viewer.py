@@ -24,7 +24,7 @@ from PyQt6.QtMultimediaWidgets import QVideoWidget
 
 from config import DB_FILE, ALL_MEDIA_EXT, EXT_IMG, EXT_GIF, EXT_VID, EXT_ZIP
 from database import get_file_tags
-from utils import load_media_thumbnail, format_size
+from utils import load_media_thumbnail, format_size, show_in_file_manager
 
 
 def format_time_ms(ms: int) -> str:
@@ -549,6 +549,8 @@ class LightboxViewerDialog(MinimizableDialog):
         QShortcut(QKeySequence("1"), self, lambda: self.set_scale_mode("FIT"))
         QShortcut(QKeySequence("2"), self, lambda: self.set_scale_mode("FILL"))
         QShortcut(QKeySequence("3"), self, lambda: self.set_scale_mode("ACTUAL"))
+        QShortcut(QKeySequence("Ctrl+E"), self, self.open_explorer)
+        QShortcut(QKeySequence("E"), self, self.open_explorer)
 
         # Load initial media
         self.update_current_display()
@@ -749,10 +751,10 @@ class LightboxViewerDialog(MinimizableDialog):
         self.btn_copy_tags.clicked.connect(self.copy_tags)
         sidebar_layout.addWidget(self.btn_copy_tags)
 
-        btn_explorer = QPushButton("📂 Open in Explorer")
-        btn_explorer.setProperty("class", "action-btn")
-        btn_explorer.clicked.connect(self.open_explorer)
-        sidebar_layout.addWidget(btn_explorer)
+        self.btn_explorer = QPushButton("📂 Open in Explorer")
+        self.btn_explorer.setProperty("class", "action-btn")
+        self.btn_explorer.clicked.connect(self.open_explorer)
+        sidebar_layout.addWidget(self.btn_explorer)
 
     def stop_all_playback(self):
         """Immediately stops all audio, video, movie, and timer playback."""
@@ -1541,11 +1543,13 @@ class LightboxViewerDialog(MinimizableDialog):
             QTimer.singleShot(1500, lambda: self.btn_copy_tags.setText("📋 Copy All Tags"))
 
     def open_explorer(self):
-        """Selects current file in Windows File Explorer."""
-        if self.file_paths and self.current_idx < len(self.file_paths):
-            p = os.path.normpath(self.file_paths[self.current_idx])
-            if os.path.exists(p):
-                subprocess.run(['explorer', f'/select,{p}'], shell=True)
+        """Selects current file in Windows File Explorer or native file manager."""
+        if self.file_paths and 0 <= self.current_idx < len(self.file_paths):
+            p = self.file_paths[self.current_idx]
+            if show_in_file_manager(p):
+                if hasattr(self, 'btn_explorer') and self.btn_explorer:
+                    self.btn_explorer.setText("📂 Opening...")
+                    QTimer.singleShot(1200, lambda: self.btn_explorer.setText("📂 Open in Explorer"))
 
     def closeEvent(self, event):
         """Ensures all video, audio, and animations stop when window is closed."""

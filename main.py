@@ -59,7 +59,7 @@ from PyQt6.QtGui import QIcon, QPixmap, QImage, QDesktopServices, QColor, QActio
 
 from config import DB_FILE, CONFIG_FILE, ALL_MEDIA_EXT, AppConfig
 from database import DatabaseSetup, get_file_tags, get_all_characters, get_all_series, get_all_search_suggestions
-from utils import add_indicator, format_size, overlay_avatar_on_grid
+from utils import add_indicator, format_size, overlay_avatar_on_grid, show_in_file_manager
 from workers import (FolderCacheScanner, ThumbnailGeneratorWorker, ImageLoaderWorker, StreamScanner, 
                      ApiFetcherWorker, PixivDownloaderWorker, BooruNameUpdateWorker, BackgroundThumbnailPreloader,
                      DatabaseOptimizerWorker)
@@ -831,16 +831,26 @@ class PixivManagerApp(QMainWindow):
 
     def open_lightbox_viewer(self, current_row, model):
         from lightbox_viewer import LightboxViewerDialog
+        target_path = None
+        selected_item = model.get_item_data(current_row)
+        if selected_item:
+            target_path = selected_item.get('id')
+
         file_paths = []
+        target_idx = 0
         for r in range(model.rowCount()):
             item = model.get_item_data(r)
             if item and item.get('type') == 'FILE':
-                file_paths.append(item.get('id'))
+                pid = item.get('id')
+                if pid:
+                    if target_path and pid == target_path:
+                        target_idx = len(file_paths)
+                    file_paths.append(pid)
         
         if not file_paths:
             return
             
-        dlg = LightboxViewerDialog(file_paths, current_index=current_row, parent=self)
+        dlg = LightboxViewerDialog(file_paths, current_index=target_idx, parent=self)
         dlg.exec()
 
     def show_folder_context_menu(self, pos):
@@ -893,9 +903,7 @@ class PixivManagerApp(QMainWindow):
         menu.exec(sender_list.mapToGlobal(pos))
 
     def open_in_explorer(self, file_path):
-        import subprocess
-        if os.path.exists(file_path):
-            subprocess.run(['explorer', '/select,', os.path.normpath(file_path)], shell=True)
+        show_in_file_manager(file_path)
 
     def show_ai_tags_dialog(self, file_path):
         tags = get_file_tags(DB_FILE, file_path)

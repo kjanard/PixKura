@@ -1,4 +1,7 @@
 import os
+import sys
+import subprocess
+import logging
 import zipfile
 try:
     import cv2
@@ -10,6 +13,51 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QPixmap, QRegion, QPainterPath, QImage, QFont
 from PyQt6.QtCore import Qt, QRect
 from config import EXT_IMG, EXT_GIF, EXT_VID, EXT_ZIP
+
+
+def show_in_file_manager(file_path: str) -> bool:
+    """
+    Opens native system file manager (Explorer on Windows, Finder on macOS, etc.)
+    and highlights/selects the given file without blocking the GUI.
+    Handles spaces, quotes, and non-existent files gracefully.
+    """
+    if not file_path:
+        return False
+
+    try:
+        p = os.path.abspath(file_path)
+        if not os.path.exists(p):
+            p_dir = os.path.dirname(p)
+            if os.path.exists(p_dir):
+                p = p_dir
+            else:
+                logging.warning(f"File manager target path does not exist: {file_path}")
+                return False
+
+        if sys.platform == 'win32':
+            norm_p = os.path.normpath(p)
+            if os.path.isfile(norm_p):
+                # Windows Explorer command syntax: explorer.exe /select,"<path>"
+                # Quotes must surround ONLY the path, not the /select switch
+                subprocess.Popen(f'explorer /select,"{norm_p}"')
+            else:
+                subprocess.Popen(f'explorer "{norm_p}"')
+            return True
+        elif sys.platform == 'darwin':
+            if os.path.isfile(p):
+                subprocess.Popen(['open', '-R', p])
+            else:
+                subprocess.Popen(['open', p])
+            return True
+        else:
+            # Linux / Unix
+            target = os.path.dirname(p) if os.path.isfile(p) else p
+            subprocess.Popen(['xdg-open', target])
+            return True
+    except Exception as e:
+        logging.error(f"Error opening file manager for {file_path}: {e}")
+        return False
+
 
 def add_indicator(pixmap, file_type):
     if not file_type: return pixmap
