@@ -17,14 +17,14 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QSize, QPoint, QPointF, QTimer, QRectF, QUrl, QEvent
 from PyQt6.QtGui import (
     QPixmap, QImage, QPainter, QColor, QFont, QKeySequence, QShortcut,
-    QWheelEvent, QMouseEvent, QMovie
+    QWheelEvent, QMouseEvent, QMovie, QBrush
 )
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 
 from config import DB_FILE, ALL_MEDIA_EXT, EXT_IMG, EXT_GIF, EXT_VID, EXT_ZIP
 from database import get_file_tags
-from utils import load_media_thumbnail, format_size, show_in_file_manager
+from utils import load_media_thumbnail, make_thumbnail_rgb, format_size, show_in_file_manager
 
 
 def format_time_ms(ms: int) -> str:
@@ -60,11 +60,82 @@ class ZoomableImageLabel(QWidget):
         self.on_zoom_changed = None
         self.setMouseTracking(True)
 
+        self.bg_mode = 'AUTO'  # 'AUTO', 'WHITE', 'DARK'
+        self._auto_bg = 'DARK'  # Dynamically calculated based on luminance
+
+        # Floating on-screen HUD toast badge
+        self._hud_message = ""
+        self._hud_timer = QTimer(self)
+        self._hud_timer.setSingleShot(True)
+        self._hud_timer.timeout.connect(self._clear_hud)
+
+    def _clear_hud(self):
+        self._hud_message = ""
+        self.update()
+
+    def show_hud(self, text: str, duration_ms: int = 1500):
+        self._hud_message = text
+        self._hud_timer.start(duration_ms)
+        self.update()
+
+    def _detect_optimal_bg(self, pixmap) -> str:
+        """
+        Analyzes pixmap to decide whether WHITE or DARK background is optimal.
+        - If image is opaque (no transparent pixels): returns 'DARK' (standard dark theme).
+        - If image has transparency:
+            - If visible content has dark lines/ink: returns 'WHITE' (manga/sketch paper style).
+            - If visible content has bright/white lines: returns 'DARK'.
+        """
+        if not pixmap or pixmap.isNull() or not pixmap.hasAlphaChannel():
+            return 'DARK'
+        try:
+            small = pixmap.toImage().convertToFormat(QImage.Format.Format_RGBA8888).scaled(
+                32, 32, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.FastTransformation
+            )
+            data = small.constBits().asstring(32 * 32 * 4)
+            has_transparency = False
+            total_lum = 0
+            vis_count = 0
+            for i in range(0, len(data), 4):
+                r = data[i]
+                g = data[i + 1]
+                b = data[i + 2]
+                a = data[i + 3]
+                if a < 250:
+                    has_transparency = True
+                if a > 30:
+                    total_lum += 0.299 * r + 0.587 * g + 0.114 * b
+                    vis_count += 1
+            if not has_transparency:
+                return 'DARK'
+            if vis_count == 0:
+                return 'WHITE'
+            mean_lum = total_lum / vis_count
+            return 'DARK' if mean_lum > 140 else 'WHITE'
+        except Exception:
+            return 'WHITE'
+
+    def set_bg_mode(self, mode: str):
+        if mode in ('AUTO', 'WHITE', 'DARK'):
+            self.bg_mode = mode
+            self.update()
+
+    def cycle_bg_mode(self):
+        modes = ['AUTO', 'WHITE', 'DARK']
+        try:
+            idx = modes.index(self.bg_mode)
+            next_mode = modes[(idx + 1) % len(modes)]
+        except ValueError:
+            next_mode = 'AUTO'
+        self.set_bg_mode(next_mode)
+        return next_mode
+
     def sizeHint(self):
         return QSize(750, 550)
 
     def set_image(self, pixmap):
         self.orig_pixmap = pixmap
+        self._auto_bg = self._detect_optimal_bg(pixmap)
         self.placeholder_text = ""
         # Maintain user's chosen view mode or default to FIT
         active_mode = self.view_mode if self.view_mode in ('FIT', 'FILL', 'ACTUAL') else 'FIT'
@@ -74,6 +145,7 @@ class ZoomableImageLabel(QWidget):
         """Updates the pixmap for animated frames without resetting pan and zoom."""
         if pixmap and not pixmap.isNull():
             self.orig_pixmap = pixmap
+            self._auto_bg = self._detect_optimal_bg(pixmap)
             self.update()
 
     def setText(self, text):
@@ -245,6 +317,19 @@ class ZoomableImageLabel(QWidget):
         target_rect = QRectF(draw_x, draw_y, draw_w, draw_h)
         source_rect = QRectF(0.0, 0.0, float(iw), float(ih))
 
+        # Render custom background canvas for transparent / line art images
+        has_alpha = bool(self.orig_pixmap and self.orig_pixmap.hasAlphaChannel())
+        eff_mode = self._auto_bg if self.bg_mode == 'AUTO' else self.bg_mode
+
+        if eff_mode == 'WHITE':
+            painter.fillRect(target_rect, QColor("#ffffff"))
+            painter.setPen(QColor(0, 0, 0, 45))
+            painter.drawRect(target_rect)
+        elif eff_mode == 'DARK':
+            if has_alpha:
+                painter.setPen(QColor(255, 255, 255, 25))
+                painter.drawRect(target_rect)
+
         painter.drawPixmap(target_rect, self.orig_pixmap, source_rect)
 
         # Subtle zoom percentage badge in bottom-left corner when zoomed
@@ -258,6 +343,19 @@ class ZoomableImageLabel(QWidget):
             painter.drawRoundedRect(badge_rect, 6, 6)
             painter.setPen(QColor("#93c5fd"))
             painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, badge_text)
+
+        # Floating HUD Notification Badge (top-center)
+        if self._hud_message:
+            painter.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+            fm = painter.fontMetrics()
+            tw = fm.horizontalAdvance(self._hud_message) + 36
+            th = 32
+            hud_rect = QRectF((vw - tw) / 2.0, 20, tw, th)
+            painter.setBrush(QColor(15, 15, 22, 230))
+            painter.setPen(QColor(59, 130, 246, 200))
+            painter.drawRoundedRect(hud_rect, 8, 8)
+            painter.setPen(QColor("#f3f4f6"))
+            painter.drawText(hud_rect, Qt.AlignmentFlag.AlignCenter, self._hud_message)
 
 
 class VideoDisplayWidget(QVideoWidget):
@@ -462,6 +560,16 @@ class LightboxViewerDialog(MinimizableDialog):
         top_layout.addWidget(self.combo_scale)
         self.btn_fit = self.combo_scale  # Backward compatibility
 
+        # Background Canvas Mode ComboBox (Auto, White, Dark)
+        self.combo_bg = QComboBox()
+        self.combo_bg.setProperty("class", "view-mode-combo")
+        self.combo_bg.setToolTip("Background Canvas for transparent images (Shortcut: B)")
+        self.combo_bg.addItem("✨ BG: Auto", "AUTO")
+        self.combo_bg.addItem("⚪ BG: White", "WHITE")
+        self.combo_bg.addItem("⬛ BG: Dark", "DARK")
+        self.combo_bg.currentIndexChanged.connect(self.on_bg_mode_selected)
+        top_layout.addWidget(self.combo_bg)
+
         btn_close = QPushButton("✕")
         btn_close.setStyleSheet("background-color: #272733; color: white; border-radius: 14px; font-weight: bold; width: 28px; height: 28px;")
         btn_close.clicked.connect(self.accept)
@@ -492,6 +600,13 @@ class LightboxViewerDialog(MinimizableDialog):
 
         self.img_view = ZoomableImageLabel(self)
         self.img_view.on_zoom_changed = self.on_zoom_changed
+        self.saved_bg_mode = self.load_saved_bg_mode()
+        self.img_view.set_bg_mode(self.saved_bg_mode)
+        bg_idx = self.combo_bg.findData(self.saved_bg_mode)
+        if bg_idx >= 0:
+            self.combo_bg.blockSignals(True)
+            self.combo_bg.setCurrentIndex(bg_idx)
+            self.combo_bg.blockSignals(False)
         self.display_stack.addWidget(self.img_view)  # Page 0
 
         self.video_widget = VideoDisplayWidget(self)
@@ -551,6 +666,8 @@ class LightboxViewerDialog(MinimizableDialog):
         QShortcut(QKeySequence("3"), self, lambda: self.set_scale_mode("ACTUAL"))
         QShortcut(QKeySequence("Ctrl+E"), self, self.open_explorer)
         QShortcut(QKeySequence("E"), self, self.open_explorer)
+        QShortcut(QKeySequence("B"), self, self.cycle_background_mode)
+        QShortcut(QKeySequence("Ctrl+B"), self, self.cycle_background_mode)
 
         # Load initial media
         self.update_current_display()
@@ -927,7 +1044,8 @@ class LightboxViewerDialog(MinimizableDialog):
                 if pil_img:
                     from io import BytesIO
                     bio = BytesIO()
-                    pil_img.save(bio, "JPEG")
+                    thumb_img = make_thumbnail_rgb(pil_img, (1920, 1080))
+                    thumb_img.save(bio, "JPEG")
                     pix = QPixmap.fromImage(QImage.fromData(bio.getvalue()))
                     self.lbl_resolution.setText(f"{pil_img.width} × {pil_img.height}")
                     self.img_view.set_image(pix)
@@ -1008,7 +1126,8 @@ class LightboxViewerDialog(MinimizableDialog):
                 if pil_img:
                     from io import BytesIO
                     bio = BytesIO()
-                    pil_img.save(bio, "JPEG")
+                    thumb_img = make_thumbnail_rgb(pil_img, (1920, 1080))
+                    thumb_img.save(bio, "JPEG")
                     pix = QPixmap.fromImage(QImage.fromData(bio.getvalue()))
                     self.lbl_resolution.setText(f"{pil_img.width} × {pil_img.height}")
                     self.img_view.set_image(pix)
@@ -1466,6 +1585,67 @@ class LightboxViewerDialog(MinimizableDialog):
             self.stop_all_playback()
             self.current_idx += 1
             self.update_current_display()
+
+    def load_saved_bg_mode(self) -> str:
+        """Loads saved background mode preference from config.json."""
+        try:
+            import json
+            from config import CONFIG_FILE
+            if os.path.exists(CONFIG_FILE):
+                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    cfg = json.load(f)
+                    val = cfg.get('lightbox_bg_mode', 'AUTO')
+                    if val in ('AUTO', 'WHITE', 'DARK'):
+                        return val
+        except Exception:
+            pass
+        return 'AUTO'
+
+    def save_bg_mode(self, mode: str):
+        """Saves background mode preference to config.json."""
+        try:
+            import json
+            from config import CONFIG_FILE
+            cfg = {}
+            if os.path.exists(CONFIG_FILE):
+                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    cfg = json.load(f)
+            cfg['lightbox_bg_mode'] = mode
+            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+                json.dump(cfg, f, indent=4)
+        except Exception as e:
+            logging.error(f"Error saving lightbox_bg_mode: {e}")
+
+    def on_bg_mode_selected(self, index: int):
+        """Handles background canvas mode dropdown change."""
+        mode = self.combo_bg.itemData(index)
+        if mode:
+            self.img_view.set_bg_mode(mode)
+            auto_name = "White" if getattr(self.img_view, '_auto_bg', 'DARK') == 'WHITE' else "Dark"
+            mode_labels = {
+                'AUTO': f"✨ Background: Auto (Smart {auto_name})",
+                'WHITE': "⚪ Background: White Canvas",
+                'DARK': "⬛ Background: Dark Canvas"
+            }
+            self.img_view.show_hud(mode_labels.get(mode, f"Background: {mode}"))
+            self.save_bg_mode(mode)
+
+    def cycle_background_mode(self):
+        """Keyboard shortcut (B) handler to cycle through background canvas modes."""
+        next_mode = self.img_view.cycle_bg_mode()
+        idx = self.combo_bg.findData(next_mode)
+        if idx >= 0:
+            self.combo_bg.blockSignals(True)
+            self.combo_bg.setCurrentIndex(idx)
+            self.combo_bg.blockSignals(False)
+        auto_name = "White" if getattr(self.img_view, '_auto_bg', 'DARK') == 'WHITE' else "Dark"
+        mode_labels = {
+            'AUTO': f"✨ Background: Auto (Smart {auto_name})",
+            'WHITE': "⚪ Background: White Canvas",
+            'DARK': "⬛ Background: Dark Canvas"
+        }
+        self.img_view.show_hud(mode_labels.get(next_mode, f"Background: {next_mode}"))
+        self.save_bg_mode(next_mode)
 
     def toggle_sidebar(self):
         """Shows/hides AI tag sidebar."""

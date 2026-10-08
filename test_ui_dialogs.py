@@ -63,6 +63,19 @@ class TestUIDialogs(unittest.TestCase):
         dlg.combo_scale.setCurrentIndex(0)
         self.assertEqual(dlg.img_view.view_mode, "FIT")
 
+        # Test combo_bg modes
+        self.assertIsNotNone(dlg.combo_bg)
+        self.assertEqual(dlg.combo_bg.count(), 3)
+        self.assertEqual(dlg.combo_bg.itemData(0), "AUTO")
+        self.assertEqual(dlg.combo_bg.itemData(1), "WHITE")
+        self.assertEqual(dlg.combo_bg.itemData(2), "DARK")
+
+        # Test background selection and cycling
+        dlg.combo_bg.setCurrentIndex(1)  # WHITE
+        self.assertEqual(dlg.img_view.bg_mode, "WHITE")
+        dlg.cycle_background_mode()  # Cycles to DARK
+        self.assertEqual(dlg.img_view.bg_mode, "DARK")
+
         # Test open_explorer on lightbox viewer
         with patch("utils.subprocess.Popen") as mock_popen:
             dlg.open_explorer()
@@ -136,6 +149,36 @@ class TestUIDialogs(unittest.TestCase):
         new_pix = QPixmap(200, 200)
         z.update_frame_pixmap(new_pix)
         self.assertEqual(z.orig_pixmap, new_pix)
+
+        # Test background modes and HUD
+        z.set_bg_mode('WHITE')
+        self.assertEqual(z.bg_mode, 'WHITE')
+        z.set_bg_mode('DARK')
+        self.assertEqual(z.bg_mode, 'DARK')
+        z.set_bg_mode('AUTO')
+        self.assertEqual(z.bg_mode, 'AUTO')
+
+        next_mode = z.cycle_bg_mode()
+        self.assertEqual(next_mode, 'WHITE')
+        z.show_hud("Test Badge", 100)
+        self.assertEqual(z._hud_message, "Test Badge")
+
+    def test_transparent_thumbnail_generation(self):
+        from utils import make_thumbnail_rgb
+        from PIL import Image, ImageDraw
+
+        # Create transparent RGBA image with a pure black line (like line art)
+        img = Image.new('RGBA', (400, 400), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.line([(50, 50), (350, 350)], fill=(0, 0, 0, 255), width=4)
+
+        thumb = make_thumbnail_rgb(img, (240, 240))
+        self.assertEqual(thumb.mode, 'RGB')
+        ext = thumb.getextrema()
+        # Opaque black line is present (min = 0)
+        self.assertEqual(ext[0][0], 0)
+        # Background is white instead of pitch black (max = 255)
+        self.assertEqual(ext[0][1], 255)
 
     def test_lightbox_animation_and_video_playback(self):
         import tempfile

@@ -59,7 +59,7 @@ from PyQt6.QtGui import QIcon, QPixmap, QImage, QDesktopServices, QColor, QActio
 
 from config import DB_FILE, CONFIG_FILE, ALL_MEDIA_EXT, AppConfig
 from database import DatabaseSetup, get_file_tags, get_all_characters, get_all_series, get_all_search_suggestions
-from utils import add_indicator, format_size, overlay_avatar_on_grid, show_in_file_manager
+from utils import add_indicator, format_size, overlay_avatar_on_grid, show_in_file_manager, make_thumbnail_rgb, load_media_thumbnail
 from workers import (FolderCacheScanner, ThumbnailGeneratorWorker, ImageLoaderWorker, StreamScanner, 
                      ApiFetcherWorker, PixivDownloaderWorker, BooruNameUpdateWorker, BackgroundThumbnailPreloader,
                      DatabaseOptimizerWorker)
@@ -900,7 +900,41 @@ class PixivManagerApp(QMainWindow):
         action_explorer.triggered.connect(lambda: self.open_in_explorer(file_path))
         menu.addAction(action_explorer)
 
+        action_reload_thumb = QAction("🔄 Regenerate Thumbnail (สร้างภาพตัวอย่างใหม่)", self)
+        action_reload_thumb.triggered.connect(lambda: self.regenerate_file_thumbnail(file_path, index.row(), sender_list.model()))
+        menu.addAction(action_reload_thumb)
+
         menu.exec(sender_list.mapToGlobal(pos))
+
+    def regenerate_file_thumbnail(self, file_path, row_idx, model):
+        try:
+            pil_img, ftype = load_media_thumbnail(file_path)
+            if pil_img:
+                thumb_img = make_thumbnail_rgb(pil_img, (240, 240))
+                bio = io.BytesIO()
+                thumb_img.save(bio, 'JPEG', quality=85)
+                blob = bio.getvalue()
+
+                # Update SQLite database cache
+                cursor = self.main_db_conn.cursor()
+                cursor.execute("INSERT OR REPLACE INTO file_thumbnails (path, image_data) VALUES (?, ?)", (file_path, blob))
+                self.main_db_conn.commit()
+
+                # Update UI immediately
+                qimg = QImage()
+                qimg.loadFromData(blob)
+                pix = QPixmap.fromImage(qimg)
+                pix = add_indicator(pix, ftype)
+                new_icon = QIcon(pix)
+
+                if file_path in self.file_item_map:
+                    self.file_item_map[file_path]['icon'] = new_icon
+                    self.file_item_map[file_path]['loaded'] = True
+
+                model.update_icon(row_idx, new_icon)
+                self.status_bar.showMessage(f"Thumbnail regenerated for: {os.path.basename(file_path)}", 3000)
+        except Exception as e:
+            logging.error(f"Error regenerating thumbnail for {file_path}: {e}")
 
     def open_in_explorer(self, file_path):
         show_in_file_manager(file_path)

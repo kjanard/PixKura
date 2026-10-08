@@ -5,7 +5,7 @@ from PyQt6.QtWidgets import (
     QProgressBar, QTextEdit, QSlider, QCheckBox, QComboBox,
     QGroupBox, QMessageBox, QFrame, QWidget, QSplitter, QFileDialog
 )
-from PyQt6.QtCore import Qt, QThreadPool, pyqtSlot, QThread, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, QThreadPool, pyqtSlot, QThread, pyqtSignal, QTimer, QObject, QRunnable
 from PyQt6.QtGui import QFont, QColor, QIcon, QPixmap
 
 from config import (
@@ -39,6 +39,24 @@ class ModelDownloadThread(QThread):
             self.finished.emit(True, "ดาวน์โหลดโมเดล AI สำเร็จเรียบร้อยแล้ว!")
         except Exception as e:
             self.finished.emit(False, str(e))
+
+class TagStatsSignals(QObject):
+    finished = pyqtSignal(dict)
+
+class TagStatsWorker(QRunnable):
+    def __init__(self, db_file, force_refresh=False):
+        super().__init__()
+        self.db_file = db_file
+        self.force_refresh = force_refresh
+        self.signals = TagStatsSignals()
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            stats = get_tag_stats(self.db_file, force_refresh=self.force_refresh)
+            self.signals.finished.emit(stats)
+        except Exception:
+            pass
 
 from components import MinimizableDialog
 
@@ -481,13 +499,20 @@ class AiTagDialog(MinimizableDialog):
             else:
                 self.lbl_elapsed.setText(f"⏱️ ใช้ไป: {mins:02d}:{secs:02d}")
 
-    def refresh_stats(self):
-        stats = get_tag_stats(DB_FILE)
-        self.lbl_stats.setText(
-            f"📊 สถิติปัจจุบัน: รูปภาพที่สแกนแล้ว <b>{stats['total_tagged_files']:,}</b> ไฟล์ | "
-            f"ตัวละครที่รู้จัก <b>{stats['unique_characters']:,}</b> ตัว | "
-            f"แท็กทั้งหมด <b>{stats['unique_tags']:,}</b> รายการ"
-        )
+    def refresh_stats(self, force_refresh=False):
+        worker = TagStatsWorker(DB_FILE, force_refresh=force_refresh)
+        worker.signals.finished.connect(self._on_stats_loaded)
+        self.thread_pool.start(worker)
+
+    def _on_stats_loaded(self, stats):
+        try:
+            self.lbl_stats.setText(
+                f"📊 สถิติปัจจุบัน: รูปภาพที่สแกนแล้ว <b>{stats['total_tagged_files']:,}</b> ไฟล์ | "
+                f"ตัวละครที่รู้จัก <b>{stats['unique_characters']:,}</b> ตัว | "
+                f"แท็กทั้งหมด <b>{stats['unique_tags']:,}</b> รายการ"
+            )
+        except RuntimeError:
+            pass
 
     def on_provider_changed(self, idx):
         use_gpu = self.combo_provider.currentData()
@@ -701,7 +726,7 @@ class AiTagDialog(MinimizableDialog):
             self.lbl_elapsed.setText(f"⏱️ ใช้ไป: {mins:02d}:{secs:02d} (เสร็จ)")
 
         self.lbl_eta.setText("⏳ เหลือ: สำเร็จ ✨")
-        self.refresh_stats()
+        self.refresh_stats(force_refresh=True)
         self.worker = None
 
     def closeEvent(self, event):

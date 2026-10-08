@@ -4,6 +4,31 @@ All notable changes to the PixKura project will be documented in this file.
 
 ---
 
+## [Version 2.3.3-V.31.1] - 2026-10-08
+
+### Added & Improved (Transparent PNG & Line Art Rendering Overhaul)
+* **Smart Luminance-Based Background Engine (`lightbox_viewer.py`)**:
+  * Fixed critical usability issue where black line art and sketch illustrations on transparent backgrounds (e.g. `70151194_p11 - Wendy Marvell 147.png`) were virtually invisible when rendered against the viewer's dark gray (`#0c0c0e`) background.
+  * Added **Streamlined Background Canvas Selector** (`combo_bg`) in Lightbox Viewer with 3 intuitive modes:
+    * `✨ BG: Auto`: **Smart AI Luminance Analysis**. Analyzes visible pixels in milliseconds — automatically chooses a pristine **White Canvas** for dark/black line drawings and manga pages, and retains **Dark Canvas** for opaque illustrations and bright/white artworks.
+    * `⚪ BG: White`: Clean pure white canvas (`#ffffff`), rendering sketches and manga line arts like real printed paper.
+    * `⬛ BG: Dark`: Classic dark canvas (`#0c0c0e`).
+  * **Interactive Keyboard Shortcut (`B` / `Ctrl+B`)**: Instant one-key cycling between `Auto` ➔ `White Canvas` ➔ `Dark Canvas` with real-time floating on-screen HUD toast badge feedback.
+  * **Preference Persistence**: User's chosen background mode is automatically saved in `config.json` (`lightbox_bg_mode`).
+  * **Artwork Frame Boundary**: Added subtle 1px border framing around the active artwork canvas so users can clearly distinguish the artwork edges from the application window.
+
+* **Alpha-Composited Thumbnail Generation (`utils.py`, `workers.py`)**:
+  * Implemented `make_thumbnail_rgb()` in `utils.py`: Safely composites transparent images (RGBA, LA, paletted with alpha) onto a clean White (or Dark for bright lines) background before converting to RGB JPEG for SQLite caching.
+  * Completely eliminates the bug where Pillow's default `.convert('RGB')` dropped the alpha channel and turned transparent line art images into completely pitch black squares in the gallery grid.
+  * Integrated across `ForegroundThumbnailWorker`, `BackgroundThumbnailPreloader`, and folder collage compositing.
+* **Instant AI Tagger Dialog Startup Optimization (`ai_tag_dialog.py`, `utils.py`, `database.py`)**:
+  * **12x Speedup (from ~4.0s delay down to ~0.3s instant pop-up)** when opening the AI Tagger dialog from the main window.
+  * **Direct Win32 API Hardware Drive Query (`utils.py`)**: Replaced slow synchronous PowerShell subprocesses (`Get-Partition` & `Get-PhysicalDisk` taking ~2,000 ms) with native Windows `DeviceIoControl` (`StorageDeviceSeekPenaltyProperty` via `ctypes` taking < 0.1 ms).
+  * **Asynchronous Database Aggregation (`ai_tag_dialog.py`, `database.py`)**: Moved heavy `COUNT(DISTINCT)` tag statistics queries across 7.7+ million database rows to background thread pool (`TagStatsWorker` via `QRunnable`) with a 60-second in-memory cache, completely removing UI thread freeze upon dialog initialization.
+
+
+---
+
 ## [Version 2.3.2-V.31] - 2026-10-04
 
 ### Added

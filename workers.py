@@ -25,7 +25,7 @@ from config import (
     DB_FILE, ALL_MEDIA_EXT, EXT_IMG, EXT_GIF, EXT_VID, EXT_ZIP,
     DEFAULT_CHARACTER_THRESHOLD, DEFAULT_GENERAL_THRESHOLD
 )
-from utils import load_media_thumbnail, overlay_avatar_on_grid, detect_drive_media_type
+from utils import load_media_thumbnail, make_thumbnail_rgb, overlay_avatar_on_grid, detect_drive_media_type
 
 import threading
 _thread_local = threading.local()
@@ -379,8 +379,8 @@ class ThumbnailGeneratorWorker(QRunnable):
         for i, f in enumerate(sample):
             img, _ = load_media_thumbnail(os.path.join(path, f))
             if img:
-                if img.mode!='RGB': img=img.convert('RGB')
-                canvas.paste(ImageOps.fit(img, (120,120), Image.Resampling.LANCZOS), pos[i])
+                img_rgb = make_thumbnail_rgb(img, (120, 120))
+                canvas.paste(ImageOps.fit(img_rgb, (120,120), Image.Resampling.LANCZOS), pos[i])
         return canvas
 
 class ImageLoaderWorker(QRunnable):
@@ -424,11 +424,9 @@ class ImageLoaderWorker(QRunnable):
                 try:
                     pil_img, _ = load_media_thumbnail(self.path)
                     if pil_img:
-                        pil_img.thumbnail((240, 240))
-                        if pil_img.mode != 'RGB':
-                            pil_img = pil_img.convert('RGB')
+                        thumb_img = make_thumbnail_rgb(pil_img, (240, 240))
                         bio = io.BytesIO()
-                        pil_img.save(bio, 'JPEG', quality=80)
+                        thumb_img.save(bio, 'JPEG', quality=80)
                         blob = bio.getvalue()
 
                         bio_load = io.BytesIO(blob)
@@ -892,11 +890,9 @@ class BackgroundThumbnailPreloader(QRunnable):
             try:
                 pil_img, _ = load_media_thumbnail(path)
                 if pil_img:
-                    pil_img.thumbnail((240, 240))
-                    if pil_img.mode != 'RGB':
-                        pil_img = pil_img.convert('RGB')
+                    thumb_img = make_thumbnail_rgb(pil_img, (240, 240))
                     bio = io.BytesIO()
-                    pil_img.save(bio, 'JPEG', quality=80)
+                    thumb_img.save(bio, 'JPEG', quality=80)
                     return path, bio.getvalue()
             except Exception:
                 pass

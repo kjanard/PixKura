@@ -137,8 +137,28 @@ def get_all_series(db_file, min_count=1):
         pass
     return series
 
-def get_tag_stats(db_file):
-    """Returns statistics of AI tagged images."""
+_TAG_STATS_CACHE = {}
+_TAG_STATS_CACHE_TIME = {}
+
+def invalidate_tag_stats_cache(db_file=None):
+    """Clears the cached tag statistics."""
+    global _TAG_STATS_CACHE, _TAG_STATS_CACHE_TIME
+    if db_file:
+        _TAG_STATS_CACHE.pop(db_file, None)
+        _TAG_STATS_CACHE_TIME.pop(db_file, None)
+    else:
+        _TAG_STATS_CACHE.clear()
+        _TAG_STATS_CACHE_TIME.clear()
+
+def get_tag_stats(db_file, force_refresh=False, max_age_seconds=60):
+    """Returns statistics of AI tagged images with in-memory caching."""
+    global _TAG_STATS_CACHE, _TAG_STATS_CACHE_TIME
+    import time
+    now = time.time()
+    if not force_refresh and db_file in _TAG_STATS_CACHE:
+        if now - _TAG_STATS_CACHE_TIME.get(db_file, 0) < max_age_seconds:
+            return dict(_TAG_STATS_CACHE[db_file])
+
     stats = {"total_tagged_files": 0, "unique_characters": 0, "unique_tags": 0}
     try:
         conn = sqlite3.connect(db_file, timeout=10.0)
@@ -150,6 +170,9 @@ def get_tag_stats(db_file):
         cursor.execute("SELECT COUNT(DISTINCT tag_name) FROM file_tags WHERE tag_name != '__none__'")
         stats["unique_tags"] = cursor.fetchone()[0] or 0
         conn.close()
+
+        _TAG_STATS_CACHE[db_file] = stats
+        _TAG_STATS_CACHE_TIME[db_file] = now
     except Exception:
         pass
     return stats
