@@ -83,4 +83,4 @@ HF_TAGS_URL = AVAILABLE_AI_MODELS[DEFAULT_MODEL_KEY]["tags_url"]
 class AppConfig:
     APP_NAME = "PixKura"
     AUTHOR = "Kurito"
-    VERSION = "2.3.3"
+    VERSION = "2.3.4"

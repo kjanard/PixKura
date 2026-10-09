@@ -4,6 +4,34 @@ All notable changes to the PixKura project will be documented in this file.
 
 ---
 
+## [Version 2.3.4-V.31.2] - 2026-10-09
+
+### Added & Improved (Danbooru API Engine & Artist Resolver Overhaul)
+* **Full Danbooru API Integration (Powered by DanbuDL Engine) (`danbooru_api.py`, `workers.py`)**:
+  * Adapted high-efficiency REST client from sibling project `DanbuDownloader` (`DanbuDL`).
+  * **Standardized User-Agent**: Configured official User-Agent format `PixKura/{VERSION} (DanbuDL-Engine; ...)` adhering to Danbooru API guidelines.
+  * **Automatic Credential Discovery**: Seamlessly detects and applies Danbooru API credentials from local `config.json` or fallback to sibling `DanbuDownloader/config.json`.
+  * **Thread-Safe Rate Limiting & Connection Pooling**: Utilizes shared `requests.Session()` with mutex-locked polite pacing (~0.8s), preventing concurrent threads from triggering HTTP 429 throttling.
+  * **Exponential Backoff**: Resilient retry loop parsing Danbooru's `Retry-After` header and handling transient 5xx server errors.
+  * **Exact URL Boundary Matching**: Enforces strict regex validation on returned artist profile URLs (`pixiv.net/(?:users|fanbox/creator|u)/{aid}`) to prevent ID prefix collisions (e.g. short ID 11 matching 115734584).
+  * **Optimized Payload**: Queries minimal attributes (`only=id,name,other_names,urls`) to drastically cut payload size and response latency.
+
+* **Permanent Resolution for Deleted Accounts & Name Update Loop (`workers.py`, `main.py`)**:
+  * Solved the perpetual 88-artist update loop: Detects when accounts have officially left Pixiv (HTTP 404 / `"User has left pixiv"`) with no Booru records, saving them as `[Deleted User]` in `pixiv_artists.db`.
+  * Subsequent scans skip deleted accounts, allowing "Update Names" to reach 100% completion cleanly.
+  * Real-time UI updates: Displays `[Deleted User] (ID)` immediately in the folder list view.
+
+* **High-Resolution Artist Avatar Auto-Fetch (`workers.py`, `main.py`)**:
+  * Automatically retrieves artist profile avatars (`imageBig`) directly from Pixiv during name resolution, storing the image blob into `artists.profile_blob` and overlaying it on folder cover collages.
+
+* **Single-Folder Context Menu Name Updater (`main.py`)**:
+  * Added `🔄 Update Artist Name (ค้นหาชื่อศิลปิน)` to the folder right-click context menu, enabling instant individual name and avatar refreshes.
+
+* **Updated Configuration Template (`config.json.example`)**:
+  * Added `lightbox_bg_mode`, `danbooru_username`, and `danbooru_api_key` to the configuration template for full out-of-the-box reference.
+
+---
+
 ## [Version 2.3.3-V.31.1] - 2026-10-08
 
 ### Added & Improved (Transparent PNG & Line Art Rendering Overhaul)

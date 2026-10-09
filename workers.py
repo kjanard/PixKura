@@ -26,6 +26,7 @@ from config import (
     DEFAULT_CHARACTER_THRESHOLD, DEFAULT_GENERAL_THRESHOLD
 )
 from utils import load_media_thumbnail, make_thumbnail_rgb, overlay_avatar_on_grid, detect_drive_media_type
+from danbooru_api import DanbooruClient
 
 import threading
 _thread_local = threading.local()
@@ -750,45 +751,15 @@ class BooruNameUpdateWorker(QRunnable):
         self.ids = ids
         self.signals = WorkerSignals()
         self.running = True
-
-    def _query_booru(self, base_url, site_name, aid):
-        patterns = [
-            f"*pixiv.net*/{aid}*",    
-            f"*pixiv.net*id={aid}*"   
-        ]
-        headers = {
-            'User-Agent': 'PixivManager/2.2.0 (Windows NT 10.0; Win64; x64)'
-        }
-        for pattern in patterns:
-            if not self.running: break
-            search_url = f"{base_url}/artists.json?search[url_matches]={pattern}"
-
-            # --- Retry loop (3 attempts) ---
-            for attempt in range(3):
-                if not self.running: break
-                try:
-                    res = requests.get(search_url, headers=headers, timeout=5)
-                    if res.status_code == 429:
-                        self.signals.api_log.emit(f"{site_name} 429: Rate limited. Retrying...")
-                        time.sleep(5)
-                        continue
-                    if res.status_code == 200:
-                        data = res.json()
-                        if data and len(data) > 0:
-                            raw_name = data[0].get('name', '')
-                            if raw_name:
-                                return raw_name.replace('_', ' ').title()
-                        break
-                    break
-                except Exception as e:
-                    logging.debug(f"{site_name} query error: {e}")
-            time.sleep(0.3)
-        return None
+        self.danbooru_client = DanbooruClient()
 
     def fetch_artist(self, aid):
-        if not self.running: return aid, None
+        if not self.running:
+            return aid, None, None, "cancelled"
 
         found_name = None
+        avatar_blob = None
+        is_pixiv_deleted = False
 
         # --- Source 1: Official Pixiv AJAX API (No login/cookie needed for public profile details) ---
         try:
@@ -804,24 +775,44 @@ class BooruNameUpdateWorker(QRunnable):
                     raw_name = data.get('body', {}).get('name')
                     if raw_name:
                         found_name = raw_name
+                        # ดึงภาพ Avatar ประจำตัว (ถ้ามี)
+                        img_url = data.get('body', {}).get('imageBig')
+                        if img_url:
+                            try:
+                                r_img = requests.get(img_url, headers={'Referer': 'https://www.pixiv.net/', 'User-Agent': headers['User-Agent']}, timeout=5)
+                                if r_img.status_code == 200 and r_img.content:
+                                    avatar_blob = r_img.content
+                            except Exception:
+                                pass
+                else:
+                    msg = str(data.get('message', '')).lower()
+                    if 'left pixiv' in msg or 'not exist' in msg:
+                        is_pixiv_deleted = True
+            elif res.status_code == 404:
+                is_pixiv_deleted = True
         except Exception as e:
-            logging.error(f"Error: {e}")
+            logging.debug(f"Pixiv fetch error for ID {aid}: {e}")
 
-        # --- Source 2: Danbooru (Complete SFW & NSFW artist registry) ---
+        # --- Source 2: Danbooru (DanbuDL Engine with Exact URL Verification) ---
         if not found_name and self.running:
-            found_name = self._query_booru("https://danbooru.donmai.us", "Danbooru", aid)
+            found_name = self.danbooru_client.find_artist_by_pixiv_id(aid)
 
         # --- Source 3: Safebooru Fallback (queries Booru metadata tags) ---
         if not found_name and self.running:
-            found_name = self._query_booru("https://safebooru.donmai.us", "Safebooru", aid)
+            found_name = self.danbooru_client.find_artist_on_safebooru(aid)
 
-        return aid, found_name
+        if found_name:
+            return aid, found_name, avatar_blob, "found"
+        elif is_pixiv_deleted:
+            # ผู้ใช้ปิด/ลบบัญชีไปแล้วจาก Pixiv และไม่มีบน Booru
+            return aid, "[Deleted User]", None, "deleted"
+        else:
+            return aid, None, None, "not_found"
 
     @pyqtSlot()
     def run(self):
-        # [Turbo 3] ใช้ ThreadPool แยกร่างทำงานพร้อมกันทีละ 3 คน!
+        # ใช้ ThreadPool แยกร่างทำงานพร้อมกันทีละ 3 คน
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            # โยนงานทั้งหมดให้ลูกน้อง 3 คนช่วยกันทำ
             futures = {executor.submit(self.fetch_artist, aid): aid for aid in self.ids}
 
             for future in concurrent.futures.as_completed(futures):
@@ -829,21 +820,29 @@ class BooruNameUpdateWorker(QRunnable):
                     executor.shutdown(wait=False, cancel_futures=True)
                     break
 
-                aid, found_name = future.result()
+                aid, found_name, avatar_blob, status = future.result()
 
                 if found_name:
                     try:
                         conn_write = get_thread_local_conn(DB_FILE, timeout=5.0)
                         cursor_write = conn_write.cursor()
-                        cursor_write.execute('UPDATE artists SET name=? WHERE artist_id=?', (found_name, aid))
-                        if cursor_write.rowcount == 0:
-                            cursor_write.execute('INSERT INTO artists (artist_id, name) VALUES(?,?)', (aid, found_name))
+                        if avatar_blob:
+                            cursor_write.execute('UPDATE artists SET name=?, profile_blob=? WHERE artist_id=?', (found_name, avatar_blob, aid))
+                            if cursor_write.rowcount == 0:
+                                cursor_write.execute('INSERT INTO artists (artist_id, name, profile_blob) VALUES (?, ?, ?)', (aid, found_name, avatar_blob))
+                        else:
+                            cursor_write.execute('UPDATE artists SET name=?, profile_blob=COALESCE(?, profile_blob) WHERE artist_id=?', (found_name, None, aid))
+                            if cursor_write.rowcount == 0:
+                                cursor_write.execute('INSERT INTO artists (artist_id, name) VALUES (?, ?)', (aid, found_name))
                         conn_write.commit()
-                        pass # conn_write.close()
-                    except Exception as e: logging.error(f"Error: {e}")
+                    except Exception as e:
+                        logging.error(f"Error saving artist {aid}: {e}")
 
-                    self.signals.api_updated.emit(aid, found_name, None)
-                    self.signals.api_log.emit(f"Found: {found_name}")
+                    self.signals.api_updated.emit(aid, found_name, avatar_blob)
+                    if status == "deleted":
+                        self.signals.api_log.emit(f"ID {aid}: บัญชีถูกลบ/ปิดไปแล้วจาก Pixiv -> บันทึกเป็น [Deleted User]")
+                    else:
+                        self.signals.api_log.emit(f"Found: {found_name}")
                 else:
                     self.signals.api_log.emit(f"ID {aid} not found in Pixiv/Danbooru/Safebooru")
 

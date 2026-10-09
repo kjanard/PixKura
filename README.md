@@ -101,9 +101,10 @@
 * **Pre-Emptive Skip Filtering**: Automatically checks local storage before queuing downloads, skipping existing files upfront and scaling the progress bar accurately.
 
 ### 10. Metadata Sync & Customization
-* **Multi-Source Name Resolution**: Resolves artist IDs against Pixiv's public profile API for accurate Unicode/Japanese nicknames, with Danbooru (comprehensive SFW & NSFW artist registry) and Safebooru as fallbacks.
+* **Multi-Source Name Resolution**: Resolves artist IDs against Pixiv's public profile API for accurate Unicode/Japanese nicknames, with Danbooru (powered by the high-efficiency DanbuDL engine with rate limiting & exact boundary regex validation) and Safebooru as fallbacks.
+* **Loop-Free Deleted Account Resolution**: Detects closed or deleted Pixiv accounts (`HTTP 404` / `"User has left pixiv"`) with no Booru matches, permanently recording them as `[Deleted User]` to eliminate infinite scan loops.
 * **Folder Cover Collage Randomization**: Regenerates 4-image collage cover grids for all or specific individual folders instantly via right-click context menus.
-* **Profile Avatars**: Downloads official artist profile avatars and overlays circular badges onto folder thumbnail grids.
+* **Profile Avatars & Quick Refresh**: Automatically downloads official artist profile avatars (`imageBig`) and overlays circular badges onto folder thumbnail grids. Right-click any individual folder to refresh its name and avatar on demand.
 
 ---
 
@@ -217,6 +218,7 @@ pixkura/
 ├── query_parser.py         # Advanced Danbooru boolean parser and multi-tag query engine with hybrid SFW/NSFW resolution
 ├── dashboard_dialog.py     # Visual Dashboard & Interactive Tag Cloud for library analytics, safety ratios, and characters
 ├── lightbox_viewer.py      # Fast In-App Image Viewer with zoom/pan, rapid photo cycling, and AI metadata sidebar
+├── danbooru_api.py         # High-efficiency Danbooru REST client (DanbuDL engine) with rate limiting, retries, and artist resolution
 ├── tagger.py               # Local AI Tagger engine (WD14 & WD v3 series) with DirectML GPU, FP16 conversion, and batched inference
 ├── ai_tag_dialog.py        # Standalone dialog for AI Model Management, Storage Profile selection, and live tagging progress
 ├── download_dialog.py      # Standalone dialog for Account-Safe Pixiv Download Manager (URL parser, R-18, Ugoira)
@@ -245,7 +247,7 @@ pixkura/
 
 This repository is pre-configured with a comprehensive `.gitignore` designed to prevent accidental leaks of sensitive personal data and avoid GitHub's 100 MB per-file upload limit:
 
-* 🔒 **Sensitive Credentials Ignored**: `config.json` (which may store your optional Pixiv `PHPSESSID` session cookie) is strictly ignored. Only the blank template `config.json.example` is committed.
+* 🔒 **Sensitive Credentials Ignored**: `config.json` (which may store your optional Pixiv `PHPSESSID` session cookie and Danbooru API credentials) is strictly ignored. Only the blank template `config.json.example` is committed.
 * 💾 **Massive Database Ignored**: Local SQLite databases (`pixiv_artists.db*`, `*.db`, `*.sqlite`) are ignored. These files contain personal file paths and cached image blobs that can easily exceed several gigabytes.
 * 🧠 **Heavy AI Weights Ignored**: The `models/` directory and all `*.onnx`, `*.pth`, and `*.bin` files are ignored to keep the repository lightweight (< 2 MB). Models are downloaded on-demand in-app with 1 click.
 * 🎞️ **Media & Temporary Files Ignored**: Downloads, temporary archives (`*.zip`, `*.ugoira`), test videos (`*.mp4`), and log files (`*.log`) are safely excluded.

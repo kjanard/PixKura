@@ -1,4 +1,7 @@
 {
   "last_folder": "",
-  "pixiv_cookie": ""
+  "pixiv_cookie": "",
+  "lightbox_bg_mode": "AUTO",
+  "danbooru_username": "",
+  "danbooru_api_key": ""
 }

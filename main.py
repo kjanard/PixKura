@@ -867,10 +867,21 @@ class PixivManagerApp(QMainWindow):
         action_ai_scan.triggered.connect(lambda: self.open_ai_tag_dialog(os.path.join(self.current_folder, aid), artist_name))
         menu.addAction(action_ai_scan)
 
+        action_update_name = QAction("🔄 Update Artist Name (ค้นหาชื่อศิลปิน)", self)
+        action_update_name.triggered.connect(lambda: self.update_single_artist_name(aid))
+        menu.addAction(action_update_name)
+
         action_randomize = QAction("Randomize Cover Collage", self)
         action_randomize.triggered.connect(lambda: self.randomize_single_folder_cover(aid))
         menu.addAction(action_randomize)
         menu.exec(self.list_folders.mapToGlobal(pos))
+
+    def update_single_artist_name(self, aid):
+        self.status_bar.showMessage(f"กำลังค้นหาชื่อศิลปิน ID {aid} (Pixiv / Danbooru)...")
+        w = BooruNameUpdateWorker([aid])
+        w.signals.api_updated.connect(self.handle_api_update)
+        w.signals.api_log.connect(lambda msg: self.status_bar.showMessage(msg))
+        self.api_pool.start(w)
 
     def show_file_context_menu(self, pos):
         sender_list = self.sender()
