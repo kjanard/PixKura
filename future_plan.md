@@ -1,10 +1,16 @@
 # Future Architecture Plan: NPU & Dedicated Edge AI Acceleration (GPU + NPU + Hailo-10H)
 
-* **Target Version**: V.32+ (Next Major Milestone)
-* **Document Status**: Proposed & Under Active Research
-* **Recent Milestones**:
-  * **V.30**: Danbooru Boolean Logic Engine (`AND`, `OR`, `NOT`, `NOR`), Strict Safety Filtering, and Lightbox Sizing Modes.
-  * **V.31**: Universal Minimizable Dialogs (`MinimizableDialog`), Two-Way Windows Taskbar Sync, and Downloader Overhaul.
+* **Target Version**: V.33+ (Next Hardware Expansion Milestone)
+* **Document Status**: Phase 1 Completed in V.32 (v2.4.0) • Phases 2–4 Pending Physical Hailo-10H / Multi-NPU Hardware
+* **Recent Completed Milestones**:
+  * **V.30 (v2.3.1)**: Danbooru Boolean Logic Engine (`AND`, `OR`, `NOT`, `NOR`), Strict Safety Filtering, and Lightbox Sizing Modes.
+  * **V.31 (v2.3.2–v2.3.4)**: Universal Minimizable Dialogs (`MinimizableDialog`), Two-Way Windows Taskbar Sync, Transparent PNG White-Canvas Engine, and DanbuDL Danbooru API Resolver.
+  * **V.32 (v2.4.0)**:
+    * Native `.mp4` Ugoira Video Conversion Engine (OpenCV `mp4v`/`avc1` with per-frame timing & Unicode path staging).
+    * Windows DPAPI Credential Encryption (`CryptProtectData`), Thread-Safe Atomic Config (`update_app_config`), and Ugoira Zip Bomb Protection.
+    * OpenCV Fast-Path RGBA White-Background Compositing (`decode_image_cv2_for_wd14`) & Dynamic Batch Size Selector (`Batch = 4 / 8 / 16 / 32`).
+    * Built-in NPU Execution Provider Integration (`OpenVINOExecutionProvider`, `QNNExecutionProvider`) & Hardware Accelerator Discovery (`detect_ai_accelerators`).
+    * ⭐ Favorites (`is:fav`), Custom Manual Tags, 🔍 64-bit Perceptual `dHash` Duplicate Finder, and 📦 One-Click LoRA / Kohya_ss Dataset Exporter.
 * **Target Hardware**: 
   * **Built-in NPUs**: Intel Core Ultra (Meteor Lake / Arrow Lake / Lunar Lake), AMD Ryzen AI (Phoenix / Hawk Point / Strix Point), Qualcomm Snapdragon X Elite, Windows 11 Copilot+ PCs.
   * **Dedicated M.2 Edge AI Coprocessors**: **Hailo-10H** M.2 PCIe Module (40 TOPS INT4 / 20 TOPS INT8, 4GB–8GB on-module LPDDR4X).
@@ -13,10 +19,10 @@
 
 ## 1. Executive Summary & Vision
 
-PixKura currently leverages DirectX 12 DirectML to accelerate Vision AI tagging on modern GPUs (AMD Radeon, NVIDIA GeForce, Intel Arc), delivering high throughput (~200–290 FPS at Batch=16, FP16). 
+PixKura leverages DirectX 12 DirectML, CUDA, OpenVINO, and QNN to accelerate Vision AI tagging on modern GPUs and SoC NPUs, delivering high throughput (~200–290 FPS at Batch=16, FP16).
 
 With the emergence of Neural Processing Units (NPUs) and dedicated M.2 Edge AI accelerators like the **Hailo-10H**, client devices now have access to high-efficiency specialized neural compute units. This document details the architectural roadmap to:
-1. **Leverage Built-in & Dedicated NPUs** for ultra-low-power, silent, and battery-friendly background tagging.
+1. **Leverage Built-in & Dedicated NPUs** for ultra-low-power, silent, and battery-friendly background tagging *(✅ Foundation & ONNX NPU Providers completed in V.32)*.
 2. **Implement Heterogeneous Hybrid Computing (GPU + NPU / Hailo-10H)** to run dual or tri-engine accelerators concurrently, maximizing throughput while eliminating GPU resource contention.
 3. **Enable Universal Edge AI Acceleration** for older desktops, mini-PCs, and NAS servers via plug-and-play M.2 PCIe accelerators.
 
@@ -26,8 +32,8 @@ With the emergence of Neural Processing Units (NPUs) and dedicated M.2 Edge AI a
 
 | Hardware Platform | Compute Power | Typical TDP | Memory Architecture | Best Use Case in PixKura |
 | :--- | :--- | :--- | :--- | :--- |
-| **Discrete / Integrated GPU** | Up to 100+ TFLOPS | 30W – 250W+ | Shared System RAM or Dedicated VRAM | High-throughput batch indexing (Batch=16, FP16) |
-| **Built-in SoC NPU** (Core Ultra / Ryzen AI) | 16 – 50 TOPS | 2W – 8W | Unified System Memory | Battery-friendly laptop tagging, zero GPU contention |
+| **Discrete / Integrated GPU** | Up to 100+ TFLOPS | 30W – 250W+ | Shared System RAM or Dedicated VRAM | High-throughput batch indexing (Batch=4..32, FP16) |
+| **Built-in SoC NPU** (Core Ultra / Ryzen AI / Snapdragon X) | 16 – 50 TOPS | 2W – 8W | Unified System Memory | Battery-friendly laptop tagging, zero GPU contention |
 | **Hailo-10H M.2 Coprocessor** | 20 TOPS (INT8) / 40 TOPS (INT4) | **~2.5W – 3.5W** | **Dedicated On-Module 4GB/8GB LPDDR4X** | 24/7 Home Server tagging, zero host RAM/VRAM footprint, upgrades any PC with an M.2 slot |
 
 ---
@@ -53,21 +59,21 @@ A thread-safe in-memory queue feeds work packages dynamically across heterogeneo
 
 ```mermaid
 graph TD
-    A[Disk Scanner & OpenCV Prefetch Pool] -->|Feed Image Tensors| Q[Thread-Safe In-Memory Queue]
+    A["Disk Scanner & OpenCV Prefetch Pool"] -->|Feed Image Tensors| Q["Thread-Safe In-Memory Queue"]
     
     subgraph Heterogeneous Co-Processing Engine
-        Q -->|Pulls Batch=16 FP16| W1[Primary GPU Worker - DirectML / CUDA]
-        Q -->|Pulls Batch=4 INT8| W2[SoC NPU Worker - OpenVINO / DirectML]
-        Q -->|Pulls Batch=8 INT8 via PCIe| W3[Hailo-10H M.2 Worker - HailoRT pyhailort]
+        Q -->|Pulls Batch=16 FP16| W1["Primary GPU Worker - DirectML / CUDA"]
+        Q -->|Pulls Batch=4 INT8| W2["SoC NPU Worker - OpenVINO / QNN"]
+        Q -->|Pulls Batch=8 INT8 via PCIe| W3["Hailo-10H M.2 Worker - HailoRT pyhailort"]
     end
     
-    W1 -->|~220 FPS| DB[(SQLite Database / Thread-Safe Connection Pool)]
+    W1 -->|~220 FPS| DB[("SQLite Database / Thread-Safe Connection Pool")]
     W2 -->|~70 FPS| DB
     W3 -->|~120 FPS| DB
 ```
 
-* **GPU Worker**: Focuses on maximum raw throughput (`batch_size=16`, FP16 half-precision) using `DmlExecutionProvider`.
-* **SoC NPU Worker**: Handles continuous background batches (`batch_size=4`, INT8 quantization).
+* **GPU Worker**: Focuses on maximum raw throughput (`batch_size=16`, FP16 half-precision) using `DmlExecutionProvider` or `CUDAExecutionProvider`.
+* **SoC NPU Worker**: Handles continuous background batches (`batch_size=4`, INT8/FP16) via `OpenVINOExecutionProvider` or `QNNExecutionProvider`.
 * **Hailo-10H Worker**: Operates via PCIe DMA using the native `pyhailort` pipeline, processing images directly in its on-module memory.
 * **Auto-Load Balancing**: Each worker pulls from the shared queue only when ready, preventing bottlenecks regardless of hardware speed differences.
 
@@ -94,14 +100,14 @@ When downloading artworks via the built-in Pixiv Downloader:
 
 ## 5. Technical Stack & Execution Providers
 
-### 5.1. Built-in SoC NPU Stack
+### 5.1. Built-in SoC NPU Stack (Supported in `tagger.py`)
 
 ```
-                       ┌──► Windows 11 Copilot+ (DirectML MCDM Driver) ──► DmlExecutionProvider(device_id=NPU)
+                       ┌──► Windows 11 Copilot+ (DirectML MCDM Driver) ──► DmlExecutionProvider
                        │
-ONNX Runtime NPU ──────┼──► Intel Core Ultra (Meteor/Arrow/Lunar Lake) ──► OpenVINOExecutionProvider(device_type='NPU')
+ONNX Runtime NPU ──────┼──► Intel Core Ultra (Meteor/Arrow/Lunar Lake) ──► OpenVINOExecutionProvider
                        │
-                       ├──► AMD Ryzen AI (Phoenix/Hawk/Strix Point) ─────► VitisAIExecutionProvider
+                       ├──► AMD Ryzen AI (Phoenix/Hawk/Strix Point) ─────► VitisAIExecutionProvider / DirectML
                        │
                        └──► Qualcomm Snapdragon X Elite ────────────────► QNNExecutionProvider
 ```
@@ -153,28 +159,25 @@ class HailoTaggerWorker:
 
 ---
 
-## 7. Implementation Roadmap
+## 7. Implementation Roadmap & Current Progress
 
-### Phase 1: Hardware Discovery & Enumeration
-- [ ] Implement NPU detection in `utils.py` (querying Windows WMI `Win32_PnPEntity` and DirectML MCDM compute adapters).
-- [ ] Implement Hailo PCIe device detection (`hailortcli scan` / `hailo_platform.Device.scan()`).
-- [ ] Display detected hardware accelerators in the AI Tag Dialog.
+### Phase 1: Hardware Discovery, Provider Integration & Dynamic Batching — ✅ COMPLETED (V.32 / v2.4.0)
+- [x] Implement NPU & AI accelerator detection in `utils.py` (`detect_ai_accelerators()` checking DirectML, CUDA, OpenVINO NPU, QNN NPU, and Hailo SDK availability).
+- [x] Integrate `OpenVINOExecutionProvider` and `QNNExecutionProvider` into `WD14Tagger.get_available_providers()` and `WD14Tagger.load_model()` (`tagger.py`).
+- [x] Display detected hardware accelerators (DirectML / CUDA / OpenVINO / QNN) and add configurable Batch Size selector (`Batch = 4 / 8 / 16 / 32`) in `AiTagDialog` (`ai_tag_dialog.py`).
+- [x] Upgrade OpenCV fast-path tensor decoder (`decode_image_cv2_for_wd14` in `workers.py`) to handle dynamic NCHW/NHWC input layouts, FP16/FP32 dtypes, and alpha-composited white backgrounds.
 
-### Phase 2: Standalone Proof-of-Concept
-- [ ] Export static INT8 ONNX model for `WD14 ConvNeXt v2`.
+### Phase 2: Standalone Hailo-10H Proof-of-Concept — ⏳ PENDING HARDWARE
+- [ ] Export static INT8 calibrated ONNX model for `WD14 ConvNeXt v2`.
 - [ ] Compile `wd14_convnextv2.hef` using the Hailo Dataflow Compiler (DFC).
-- [ ] Benchmark standalone inference FPS and power draw across GPU vs NPU vs Hailo-10H.
+- [ ] Benchmark standalone inference FPS and power draw across GPU vs SoC NPU vs Hailo-10H.
 
-### Phase 3: Heterogeneous Co-Processing Engine
-- [ ] Implement thread-safe producer-consumer queue in `workers.py`.
-- [ ] Support dual-accelerator pairing: `GPU + NPU` or `GPU + Hailo-10H`.
-- [ ] Measure aggregated FPS scaling and verify zero SQLite lock contention.
+### Phase 3: Heterogeneous Multi-Device Co-Processing Engine — ⏳ PLANNED (V.33+)
+- [x] Implement thread-safe producer-consumer prefetch queue (`prefetch_queue` & `idx_queue`) in `workers.py`.
+- [ ] Support simultaneous multi-session worker pairing (`GPU Session + NPU/Hailo Session` pulling from the same `prefetch_queue` concurrently).
+- [ ] Measure aggregated FPS scaling across dual accelerators.
 
-### Phase 4: UI & Mode Selector
-- [ ] Add Hardware Acceleration Selector in `ai_tag_dialog.py`:
-  * `Auto (Smart Selection)`
-  * `GPU Only (DirectML)`
-  * `NPU Only (Eco & Battery Friendly)`
-  * `Hailo-10H (Dedicated M.2 Edge AI - 2.5W)`
-  * `⚡ Hybrid Co-Processing (GPU + NPU / Hailo)`
-- [ ] Add real-time hardware status indicators (GPU FPS / NPU FPS / Hailo FPS).
+### Phase 4: Hybrid Mode UI & Telemetry — ⏳ PLANNED (V.33+)
+- [x] Add GPU / CPU-Eco accelerator selector and dynamic batch size controls in `ai_tag_dialog.py`.
+- [ ] Add dedicated `Hailo-10H (M.2 Edge AI - 2.5W)` and `⚡ Hybrid Co-Processing (GPU + NPU / Hailo)` modes once Phase 2 `.hef` runtime is validated.
+- [ ] Add per-device FPS telemetry split (`GPU FPS` vs `NPU/Hailo FPS`).
