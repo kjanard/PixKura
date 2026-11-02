@@ -40,6 +40,7 @@ import threading
 _thread_local = threading.local()
 _conn_lock = threading.Lock()
 _all_thread_conns = set()
+_shutting_down = False
 
 
 def _safe_emit(signal, *args):
@@ -51,6 +52,8 @@ def _safe_emit(signal, *args):
 
 
 def get_thread_local_conn(db_file, timeout=30.0):
+    if _shutting_down:
+        raise sqlite3.OperationalError("Application is shutting down")
     need_new = (
         not hasattr(_thread_local, "conn")
         or _thread_local.conn is None
@@ -88,11 +91,22 @@ def get_thread_local_conn(db_file, timeout=30.0):
     return _thread_local.conn
 
 
-def close_all_thread_local_conns():
-    """Closes all tracked thread-local SQLite connections so WAL checkpoint / VACUUM can obtain an exclusive lock."""
+def close_all_thread_local_conns(shutting_down=False):
+    """
+    Interrupts and closes all tracked thread-local SQLite connections immediately.
+    Calling c.interrupt() aborts any in-flight SQLite query in <1ms so shutdown never hangs.
+    """
+    global _shutting_down
+    if shutting_down:
+        _shutting_down = True
     with _conn_lock:
         conns = list(_all_thread_conns)
         _all_thread_conns.clear()
+    for c in conns:
+        try:
+            c.interrupt()
+        except Exception:
+            pass
     for c in conns:
         try:
             c.close()

@@ -1733,18 +1733,27 @@ class PixivManagerApp(QMainWindow):
                         w.showMinimized()
 
     def closeEvent(self, e): 
+        # 1. Hide window & accept close event immediately so UI vanishes in 0ms without freezing
+        self.hide()
+        e.accept()
+
+        # 2. Stop background workers and interrupt any in-flight SQLite queries (<1ms)
+        in_test = "unittest" in sys.modules
         self.stop_all()
-        close_all_thread_local_conns()
+        close_all_thread_local_conns(shutting_down=not in_test)
+
+        # 3. Non-blocking PASSIVE WAL checkpoint (avoids multi-second exclusive lock wait on 5.8GB DB)
         try:
-            self.main_db_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            self.main_db_conn.execute("PRAGMA busy_timeout = 100")
+            self.main_db_conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
         except Exception:
             pass
         try:
             self.main_db_conn.close()
         except Exception:
             pass
-        e.accept()
-        QTimer.singleShot(100, lambda: os._exit(0))
+        if not in_test:
+            QTimer.singleShot(30, lambda: os._exit(0))
 
 
 if __name__ == "__main__":

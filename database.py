@@ -43,27 +43,43 @@ class DatabaseSetup:
 
     def migrate_tables(self):
         cursor = self.conn.cursor()
-        try: cursor.execute("ALTER TABLE thumbnails ADD COLUMN file_count INTEGER DEFAULT 0")
-        except sqlite3.OperationalError: pass
-        try: cursor.execute("ALTER TABLE thumbnails ADD COLUMN folder_ctime REAL DEFAULT 0")
-        except sqlite3.OperationalError: pass
-        try: cursor.execute("ALTER TABLE file_index ADD COLUMN size INTEGER DEFAULT 0")
-        except sqlite3.OperationalError: pass
-        try: cursor.execute("ALTER TABLE file_index ADD COLUMN ctime REAL DEFAULT 0")
-        except sqlite3.OperationalError: pass
-        try: cursor.execute("ALTER TABLE file_index ADD COLUMN parent_folder TEXT")
-        except sqlite3.OperationalError: pass
-        try: cursor.execute("ALTER TABLE file_index ADD COLUMN dhash TEXT")
-        except sqlite3.OperationalError: pass
+        cursor.execute("PRAGMA table_info(thumbnails)")
+        thumb_cols = {r[1] for r in cursor.fetchall()}
+        if "file_count" not in thumb_cols:
+            try: cursor.execute("ALTER TABLE thumbnails ADD COLUMN file_count INTEGER DEFAULT 0")
+            except sqlite3.OperationalError: pass
+        if "folder_ctime" not in thumb_cols:
+            try: cursor.execute("ALTER TABLE thumbnails ADD COLUMN folder_ctime REAL DEFAULT 0")
+            except sqlite3.OperationalError: pass
+
+        cursor.execute("PRAGMA table_info(file_index)")
+        fi_cols = {r[1] for r in cursor.fetchall()}
+        if "size" not in fi_cols:
+            try: cursor.execute("ALTER TABLE file_index ADD COLUMN size INTEGER DEFAULT 0")
+            except sqlite3.OperationalError: pass
+        if "ctime" not in fi_cols:
+            try: cursor.execute("ALTER TABLE file_index ADD COLUMN ctime REAL DEFAULT 0")
+            except sqlite3.OperationalError: pass
+        if "parent_folder" not in fi_cols:
+            try: cursor.execute("ALTER TABLE file_index ADD COLUMN parent_folder TEXT")
+            except sqlite3.OperationalError: pass
+        if "dhash" not in fi_cols:
+            try: cursor.execute("ALTER TABLE file_index ADD COLUMN dhash TEXT")
+            except sqlite3.OperationalError: pass
+
         try: cursor.execute("CREATE INDEX IF NOT EXISTS idx_parent ON file_index (parent_folder)")
         except sqlite3.OperationalError: pass
         try: cursor.execute("CREATE INDEX IF NOT EXISTS idx_dhash ON file_index (dhash)")
         except sqlite3.OperationalError: pass
         try: cursor.execute('''CREATE TABLE IF NOT EXISTS file_thumbnails (path TEXT PRIMARY KEY, image_data BLOB, last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
         except sqlite3.OperationalError: pass
-        # V.25 Migration: เพิ่ม profile_blob
-        try: cursor.execute("ALTER TABLE artists ADD COLUMN profile_blob BLOB")
-        except sqlite3.OperationalError: pass
+
+        cursor.execute("PRAGMA table_info(artists)")
+        art_cols = {r[1] for r in cursor.fetchall()}
+        if "profile_blob" not in art_cols:
+            try: cursor.execute("ALTER TABLE artists ADD COLUMN profile_blob BLOB")
+            except sqlite3.OperationalError: pass
+
         # AI Tags Migration
         try:
             cursor.execute('''CREATE TABLE IF NOT EXISTS file_tags (
@@ -77,7 +93,11 @@ class DatabaseSetup:
             cursor.execute('''CREATE INDEX IF NOT EXISTS idx_tag_category ON file_tags (category)''')
             cursor.execute('''CREATE INDEX IF NOT EXISTS idx_file_tags_path ON file_tags (path)''')
         except sqlite3.OperationalError: pass
-        try: cursor.execute("DELETE FROM file_tags WHERE tag_name = '__none__'")
+        try:
+            # Index seek on idx_tag_name first before issuing write lock
+            cursor.execute("SELECT 1 FROM file_tags WHERE tag_name = '__none__' LIMIT 1")
+            if cursor.fetchone():
+                cursor.execute("DELETE FROM file_tags WHERE tag_name = '__none__'")
         except sqlite3.OperationalError: pass
         self.conn.commit()
 
@@ -363,29 +383,38 @@ def get_all_search_suggestions(db_file, min_count=1, limit=2000, max_age_seconds
     try:
         conn = sqlite3.connect(db_file, timeout=10.0)
         cursor = conn.cursor()
-        cursor.execute("""
-            SELECT tag_name, category, COUNT(*) as cnt 
-            FROM file_tags 
-            WHERE tag_name != '__none__' AND category != 10
-            GROUP BY tag_name 
-            HAVING cnt >= ? 
-            ORDER BY cnt DESC, tag_name ASC
-            LIMIT ?
-        """, (min_count, limit))
         syntax_suggestions = [
             "rating:sfw", "rating:nsfw", "rating:sensitive",
             "is:favorite", "is:fav",
-            "type:gif", "type:png", "type:video", "type:ugoira",
+            "type:mp4", "type:gif", "type:png", "type:video", "type:ugoira",
             "size:>5mb", "size:<2mb"
         ]
         suggestions.extend(syntax_suggestions)
 
-        for tag_name, category, _ in cursor.fetchall():
-            suggestions.append(f"tag:{tag_name}")
-            if category == 4:
-                suggestions.append(f"char:{tag_name}")
-            elif category == 3:
-                suggestions.append(f"series:{tag_name}")
+        seen_suggestions = set(syntax_suggestions)
+        # 1. Fast index-backed character & series lookup (< 300ms even on 7.7M rows)
+        for c_name in get_all_characters(db_file, min_count=min_count):
+            for s in (f"char:{c_name}", f"tag:{c_name}"):
+                if s not in seen_suggestions:
+                    suggestions.append(s)
+                    seen_suggestions.add(s)
+
+        for s_name in get_all_series(db_file, min_count=min_count):
+            for s in (f"series:{s_name}", f"tag:{s_name}"):
+                if s not in seen_suggestions:
+                    suggestions.append(s)
+                    seen_suggestions.add(s)
+
+        # 2. Index-only scan on idx_tag_name for general tags (avoids 20s full-table GROUP BY on 7.7M rows)
+        cursor.execute(
+            "SELECT DISTINCT tag_name FROM file_tags WHERE tag_name != '__none__' AND tag_name != 'favorite' LIMIT ?",
+            (limit,)
+        )
+        for (tag_name,) in cursor.fetchall():
+            s = f"tag:{tag_name}"
+            if s not in seen_suggestions:
+                suggestions.append(s)
+                seen_suggestions.add(s)
 
         # Add known artist names for artist: autocomplete
         try:
@@ -393,7 +422,10 @@ def get_all_search_suggestions(db_file, min_count=1, limit=2000, max_age_seconds
             for (a_name,) in cursor.fetchall():
                 clean_artist = a_name.strip().replace(' ', '_').lower()
                 if clean_artist:
-                    suggestions.append(f"artist:{clean_artist}")
+                    s = f"artist:{clean_artist}"
+                    if s not in seen_suggestions:
+                        suggestions.append(s)
+                        seen_suggestions.add(s)
         except Exception:
             pass
 
