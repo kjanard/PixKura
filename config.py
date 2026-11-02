@@ -220,9 +220,29 @@ AVAILABLE_AI_MODELS = {
         "subdir": "wd_v3_swinv2",
         "legacy": False
     },
+    "wd-v3-eva02-large": {
+        "id": "wd-v3-eva02-large",
+        "name": "🏆 WD Tagger v3 - EVA02-Large (King of Taggers / แม่นยำที่สุด 🔥)",
+        "short_name": "WD v3 EVA02-Large",
+        "repo": "SmilingWolf/wd-eva02-large-tagger-v3",
+        "model_url": "https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3/resolve/main/model.onnx",
+        "tags_url": "https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3/resolve/main/selected_tags.csv",
+        "subdir": "wd_v3_eva02_large",
+        "legacy": False
+    },
+    "wd-v3-vit-large": {
+        "id": "wd-v3-vit-large",
+        "name": "🎯 WD Tagger v3 - ViT-Large (Vision Transformer Large / วิเคราะห์ภาพซับซ้อน)",
+        "short_name": "WD v3 ViT-Large",
+        "repo": "SmilingWolf/wd-vit-large-tagger-v3",
+        "model_url": "https://huggingface.co/SmilingWolf/wd-vit-large-tagger-v3/resolve/main/model.onnx",
+        "tags_url": "https://huggingface.co/SmilingWolf/wd-vit-large-tagger-v3/resolve/main/selected_tags.csv",
+        "subdir": "wd_v3_vit_large",
+        "legacy": False
+    },
     "wd-v3-ensemble": {
         "id": "wd-v3-ensemble",
-        "name": "👑 WD Tagger v3 - Ensemble (รวมพลัง 3 โมเดล: ConvNeXt + ViT + SwinV2)",
+        "name": "👑 WD Tagger v3 - Standard Ensemble (3-in-1: ConvNeXt + ViT + SwinV2)",
         "short_name": "WD v3 Ensemble (3-in-1)",
         "repo": "SmilingWolf/wd-v3-ensemble",
         "model_url": "",
@@ -230,6 +250,18 @@ AVAILABLE_AI_MODELS = {
         "subdir": "wd_v3_ensemble",
         "is_ensemble": True,
         "ensemble_keys": ["wd-v3-convnext", "wd-v3-vit", "wd-v3-swinv2"],
+        "legacy": False
+    },
+    "wd-v3-ultra-ensemble": {
+        "id": "wd-v3-ultra-ensemble",
+        "name": "👑 WD Tagger v3 - Ultra Ensemble (รวมพลัง 3 ตัวท็อป: EVA02-Large + SwinV2 + ConvNeXt 🔥)",
+        "short_name": "WD v3 Ultra Ensemble",
+        "repo": "SmilingWolf/wd-v3-ultra-ensemble",
+        "model_url": "",
+        "tags_url": "",
+        "subdir": "wd_v3_ultra_ensemble",
+        "is_ensemble": True,
+        "ensemble_keys": ["wd-v3-eva02-large", "wd-v3-swinv2", "wd-v3-convnext"],
         "legacy": False
     }
 }

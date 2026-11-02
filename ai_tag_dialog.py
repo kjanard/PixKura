@@ -228,9 +228,16 @@ class AiTagDialog(MinimizableDialog):
         self.combo_scan_mode.setStyleSheet("background-color: #1e293b; color: white; border: 1px solid #475569; padding: 4px; border-radius: 4px; font-weight: bold;")
         self.combo_scan_mode.addItem("⚡ โหมดด่วน (Quick Mode) - สแกนเฉพาะรูปที่ยังไม่มีแท็ก [แนะนำ]", False)
         self.combo_scan_mode.addItem("🔄 สแกนใหม่ทั้งหมด (Full Re-scan) - สแกนทับทุกรูปเพื่ออัปเดตแท็กใหม่", True)
+        self.combo_scan_mode.currentIndexChanged.connect(self._on_scan_mode_changed)
         mode_row.addWidget(lbl_mode)
         mode_row.addWidget(self.combo_scan_mode, 1)
         settings_layout.addLayout(mode_row)
+
+        # Re-scan Unknown Characters Option
+        self.chk_unknown_chars = QCheckBox("🔍 ทวนหา Tag ซ้ำสำหรับภาพที่ยังเป็น Unknown Character (ไม่ทราบชื่อตัวละคร)")
+        self.chk_unknown_chars.setStyleSheet("color: #38bdf8; font-weight: bold; padding: 2px 0;")
+        self.chk_unknown_chars.setToolTip("สำหรับรูปภาพที่เคยสแกนแท็กไปแล้ว แต่ยังไม่มีชื่อตัวละคร (Unknown Character)\nระบบจะนำกลับมาสแกนซ้ำด้วยโมเดลใหม่ เพื่อระบุตัวละครที่ตกหล่นให้ครบถ้วน")
+        settings_layout.addWidget(self.chk_unknown_chars)
 
         # Threshold Slider Row
         thresh_row = QHBoxLayout()
@@ -597,6 +604,13 @@ class AiTagDialog(MinimizableDialog):
                 self.combo_scope.addItem(item_text, folder)
                 self.combo_scope.setCurrentIndex(self.combo_scope.count() - 1)
 
+    def _on_scan_mode_changed(self, idx=0):
+        is_full_rescan = self.combo_scan_mode.currentData()
+        if is_full_rescan:
+            self.chk_unknown_chars.setEnabled(False)
+        else:
+            self.chk_unknown_chars.setEnabled(True)
+
     def start_scan(self):
         model_key = self.combo_model.currentData() or DEFAULT_MODEL_KEY
         if not WD14Tagger.is_model_installed(model_key):
@@ -622,6 +636,7 @@ class AiTagDialog(MinimizableDialog):
         target_root = self.combo_scope.currentData()
         char_thresh = self.slider_thresh.value() / 100.0
         rescan = self.combo_scan_mode.currentData()
+        rescan_unknown = self.chk_unknown_chars.isChecked() and not rescan
         use_fp16 = self.combo_prec.currentData()
         storage_mode = self.combo_storage.currentData() or "auto"
         model_key = self.combo_model.currentData() or DEFAULT_MODEL_KEY
@@ -638,6 +653,7 @@ class AiTagDialog(MinimizableDialog):
         self.combo_batch.setEnabled(False)
         self.combo_storage.setEnabled(False)
         self.combo_scan_mode.setEnabled(False)
+        self.chk_unknown_chars.setEnabled(False)
         self.slider_thresh.setEnabled(False)
         self.progress_bar.setValue(0)
 
@@ -657,6 +673,7 @@ class AiTagDialog(MinimizableDialog):
             char_threshold=char_thresh,
             gen_threshold=char_thresh,
             rescan_existing=rescan,
+            rescan_unknown_chars=rescan_unknown,
             inference_batch=inf_batch
         )
         self.worker.signals.progress.connect(self.on_scan_progress)
@@ -729,6 +746,7 @@ class AiTagDialog(MinimizableDialog):
         self.combo_batch.setEnabled(True)
         self.combo_storage.setEnabled(True)
         self.combo_scan_mode.setEnabled(True)
+        self._on_scan_mode_changed()
         self.slider_thresh.setEnabled(True)
         self.lbl_speed.setText("ความเร็ว: 0.0 FPS")
 

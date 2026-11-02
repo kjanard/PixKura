@@ -23,14 +23,14 @@
 ## Key Features
 
 ### 1. Local GPU & NPU AI Character & Tag Classifier (DirectML / OpenVINO / QNN)
-* **Multi-Model Registry & Ensemble Engine (WD14 & WD v3 Series)**: Built-in support for **WD14 ConvNeXt v2**, the latest **WD Tagger v3 Series** (`ConvNeXt`, `ViT`, `SwinV2`), and **👑 WD Tagger v3 Ensemble (3-in-1)** using Soft-Voting Probability Averaging for ultra-accurate character detection and false-positive noise reduction.
+* **Multi-Model Registry & Ensemble Engine (WD14 & WD v3 Series)**: Built-in support for **WD14 ConvNeXt v2**, the latest **WD Tagger v3 Series** (`ConvNeXt`, `ViT`, `SwinV2`, `EVA02-Large`, `ViT-Large`), **Standard Ensemble (3-in-1)**, and **👑 WD Tagger v3 Ultra Ensemble (EVA02-Large + SwinV2 + ConvNeXt)** using Soft-Voting Probability Averaging for top-tier character detection and false-positive noise reduction.
 * **Universal GPU & NPU Acceleration**: Native DirectX 12 (`DirectML`), `CUDA`, `OpenVINO` (Intel Core Ultra NPU / Arc), and `QNN` (Snapdragon X Elite NPU) acceleration.
 * **FP16 Half-Precision Optimization**: Automated conversion of ONNX models to FP16 half-precision, cutting VRAM consumption by 50% and utilizing native Rapid Packed Math (RPM) for 2x mathematical throughput.
 * **Configurable Dynamic Batched GPU Inference (`Batch = 4 / 8 / 16 / 32`)**: Eliminates GPU kernel launch latency by stacking image tensors per run, boosting tagging speed to **~200–290 FPS** (~14 minutes for 250,000+ images) while adapting to any VRAM capacity.
 * **Alpha-Aware C++ OpenCV Image Preprocessing**: Uses `cv2.imdecode` (`IMREAD_UNCHANGED` via `np.fromfile` for 100% Unicode path support) and composites 4-channel transparent PNGs onto a pure white `(255, 255, 255)` background before resizing to release Python's GIL and ensure accurate tag prediction on transparent line art and stickers.
 * **Adaptive Storage Engine (Auto HDD vs SSD)**: Automatically detects physical drive media (`HDD` vs `SSD`); applies directory-based file sorting (`sort by dirname`) and limits I/O concurrency to 3–4 threads on spinning HDDs to eliminate mechanical head thrashing, while scaling to 16 threads on NVMe/SATA SSDs.
 * **Real-time Stopwatch & Metrics**: Live running stopwatch timer (`⏱️ ใช้ไป: mm:ss`), auto-freezing upon completion, paired with monotonically stable real-time average FPS and accurate ETA remaining countdown.
-* **Quick Mode vs Full Re-scan**: Dedicated scan mode selector defaulting to **Quick Mode** (scans only untagged files, automatically skipping files with existing tags in SQLite) alongside **Full Re-scan** mode for refreshing tags across the entire library.
+* **Quick Mode, Full Re-scan & Unknown Character Re-scan**: Dedicated scan mode selector defaulting to **Quick Mode** (scans only untagged files, automatically skipping files with existing tags in SQLite) alongside **Full Re-scan** mode, plus a dedicated **🔍 Re-scan Unknown Characters** option to specifically re-evaluate previously tagged images that still lack recognized character tags.
 
 ### 2. Curated Collections, Duplicate Finder & LoRA Dataset Exporter (V.32)
 * **⭐ Favorites & Custom Manual Tags**:

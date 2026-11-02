@@ -1881,7 +1881,9 @@ class AiTaggingWorker(QRunnable):
                  storage_mode="auto",
                  char_threshold=DEFAULT_CHARACTER_THRESHOLD,
                  gen_threshold=DEFAULT_GENERAL_THRESHOLD,
-                 rescan_existing=False, batch_size=50, throttle=0.0,
+                 rescan_existing=False,
+                 rescan_unknown_chars=False,
+                 batch_size=50, throttle=0.0,
                  inference_batch=16):
         super().__init__()
         self.root_path = root_path
@@ -1893,6 +1895,7 @@ class AiTaggingWorker(QRunnable):
         self.char_threshold = char_threshold
         self.gen_threshold = gen_threshold
         self.rescan_existing = rescan_existing
+        self.rescan_unknown_chars = rescan_unknown_chars
         self.batch_size = batch_size
         self.throttle = throttle
         self.inference_batch = max(1, int(inference_batch or 16))
@@ -1974,6 +1977,40 @@ class AiTaggingWorker(QRunnable):
             if self.rescan_existing:
                 target_files = disk_files
                 _safe_emit(self.signals.log, f"🔄 โหมดสแกนใหม่ทั้งหมด (Full Re-scan): เตรียมสแกนทับทั้งหมด {len(target_files):,} ไฟล์...")
+            elif self.rescan_unknown_chars:
+                if self.root_path:
+                    search_prefix = self.root_path + os.sep
+                    search_prefix_upper = self.root_path + os.sep + "\uffff"
+                    cursor.execute(
+                        "SELECT DISTINCT path FROM file_tags WHERE path >= ? AND path < ? AND tag_name != '__none__' AND category NOT IN (10, 11, 99)",
+                        (search_prefix, search_prefix_upper)
+                    )
+                    already_tagged_set = {row[0] for row in cursor.fetchall()}
+                    cursor.execute(
+                        "SELECT DISTINCT path FROM file_tags WHERE path >= ? AND path < ? AND category = 4 AND tag_name != '__none__'",
+                        (search_prefix, search_prefix_upper)
+                    )
+                    known_char_set = {row[0] for row in cursor.fetchall()}
+                else:
+                    cursor.execute(
+                        "SELECT DISTINCT path FROM file_tags WHERE tag_name != '__none__' AND category NOT IN (10, 11, 99)"
+                    )
+                    already_tagged_set = {row[0] for row in cursor.fetchall()}
+                    cursor.execute(
+                        "SELECT DISTINCT path FROM file_tags WHERE category = 4 AND tag_name != '__none__'"
+                    )
+                    known_char_set = {row[0] for row in cursor.fetchall()}
+
+                target_files = [f for f in disk_files if f not in known_char_set]
+                unknown_count = sum(1 for f in target_files if f in already_tagged_set)
+                new_count = len(target_files) - unknown_count
+                skipped_count = len(disk_files) - len(target_files)
+                _safe_emit(
+                    self.signals.log,
+                    f"🔍 โหมดทวนหาตัวละคร (Unknown Character Re-scan): เตรียมสแกนทั้งหมด {len(target_files):,} ไฟล์ "
+                    f"(ไฟล์ใหม่ {new_count:,} + ภาพที่ไม่ทราบตัวละคร {unknown_count:,} ไฟล์ | "
+                    f"ข้าม {skipped_count:,} ภาพที่รู้จักตัวละครอยู่แล้ว)..."
+                )
             else:
                 if self.root_path:
                     search_prefix = self.root_path + os.sep
@@ -2188,6 +2225,9 @@ class AiTaggingWorker(QRunnable):
             # Batched commit to SQLite
             if len(batch_tags) >= self.batch_size * 5 or items_processed >= total_files:
                 try:
+                    if self.rescan_existing or self.rescan_unknown_chars:
+                        batch_paths = list({t[0] for t in batch_tags})
+                        cursor.executemany("DELETE FROM file_tags WHERE path = ? AND category NOT IN (10, 11)", [(p,) for p in batch_paths])
                     cursor.executemany("""
                         INSERT OR REPLACE INTO file_tags (path, tag_name, category, confidence)
                         VALUES (?, ?, ?, ?)
@@ -2207,6 +2247,9 @@ class AiTaggingWorker(QRunnable):
         # Commit any leftover batch
         if batch_tags:
             try:
+                if self.rescan_existing or self.rescan_unknown_chars:
+                    batch_paths = list({t[0] for t in batch_tags})
+                    cursor.executemany("DELETE FROM file_tags WHERE path = ? AND category NOT IN (10, 11)", [(p,) for p in batch_paths])
                 cursor.executemany("""
                     INSERT OR REPLACE INTO file_tags (path, tag_name, category, confidence)
                     VALUES (?, ?, ?, ?)

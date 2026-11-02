@@ -7,6 +7,11 @@ All notable changes to the PixKura project will be documented in this file.
 ## [Version 2.4.0-V.32] - 2026-11-02
 
 ### Added (Security Hardening, Native `.mp4` Ugoira, Favorites, Duplicate Finder & Dataset Exporter)
+* **Flagship AI Tagger Models & Ultra Ensemble (`config.py`, `tagger.py`, `ai_tag_dialog.py`, `workers.py`)**:
+  * Added **`WD v3 - EVA02-Large` (`SmilingWolf/wd-eva02-large-tagger-v3`)**: Flagship ~300M parameter model recognized as the highest-accuracy anime tagger in the community, excelling in subtle character attributes, rare characters, and complex scenes with zero tag noise.
+  * Added **`WD v3 - ViT-Large` (`SmilingWolf/wd-vit-large-tagger-v3`)**: Large Vision Transformer architecture providing rich attention mapping across intricate backgrounds and diverse illustration styles.
+  * Added **`WD v3 - Ultra Ensemble` (`wd-v3-ultra-ensemble`)**: A powerhouse 3-in-1 ensemble combining `EVA02-Large` (transformer), `SwinV2` (hierarchical transformer), and `ConvNeXt` (convolutional network) via soft-voting probability averaging for unmatched reliability.
+  * Added **🔍 Re-scan Unknown Characters Option (`ai_tag_dialog.py`, `workers.py`)**: Dedicated checkbox allowing users to specifically re-evaluate previously tagged artworks that still lack recognized character tags (`category = 4`), automatically skipping known characters while applying the new AI model to uncover missed characters.
 * **Native `.mp4` Ugoira Video Conversion (`workers.py`)**:
   * Upgraded `PixivDownloaderWorker.process_ugoira` (and pre-emptive skip checks across `ILLUST`, `ARTIST`, and `BOOKMARK` modes) to compile downloaded Pixiv Ugoira ZIP frames and variable per-frame delays directly into high-efficiency `.mp4` video files via OpenCV (`convert_frames_to_mp4`).
   * Eliminates 256-color GIF quantization artifacts, preserves full 24-bit color fidelity, reduces output file sizes by 70–85%, supports Unicode destination paths on Windows via temporary staging, and automatically pads odd dimensions `(w + w % 2, h + h % 2)` for H.264/MPEG-4 hardware decoder compatibility (with automatic fallback to `.gif` if OpenCV is unavailable).

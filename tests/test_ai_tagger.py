@@ -125,11 +125,18 @@ class TestWD14Tagger(unittest.TestCase):
         self.assertIn("wd-v3-convnext", AVAILABLE_AI_MODELS)
         self.assertIn("wd-v3-vit", AVAILABLE_AI_MODELS)
         self.assertIn("wd-v3-swinv2", AVAILABLE_AI_MODELS)
+        self.assertIn("wd-v3-eva02-large", AVAILABLE_AI_MODELS)
+        self.assertIn("wd-v3-vit-large", AVAILABLE_AI_MODELS)
         self.assertIn("wd-v3-ensemble", AVAILABLE_AI_MODELS)
+        self.assertIn("wd-v3-ultra-ensemble", AVAILABLE_AI_MODELS)
         
         paths = get_model_paths("wd-v3-convnext")
         self.assertIn("wd_v3_convnext", paths["dir"])
         self.assertTrue(paths["model_fp32"].endswith("model.onnx"))
+
+        paths_eva = get_model_paths("wd-v3-eva02-large")
+        self.assertIn("wd_v3_eva02_large", paths_eva["dir"])
+        self.assertTrue(paths_eva["model_fp32"].endswith("model.onnx"))
 
     def test_10_ensemble_registry_and_check(self):
         from tagger import get_model_paths, WD14Tagger
@@ -137,10 +144,18 @@ class TestWD14Tagger(unittest.TestCase):
         self.assertTrue(paths["meta"]["is_ensemble"])
         self.assertEqual(len(paths["meta"]["ensemble_keys"]), 3)
         
-        # Test ensemble tagger initialization
+        # Test standard ensemble tagger initialization
         tagger = WD14Tagger("wd-v3-ensemble")
         self.assertTrue(tagger.is_ensemble)
         self.assertEqual(tagger.ensemble_keys, ["wd-v3-convnext", "wd-v3-vit", "wd-v3-swinv2"])
+
+        # Test ultra ensemble tagger initialization
+        paths_ultra = get_model_paths("wd-v3-ultra-ensemble")
+        self.assertTrue(paths_ultra["meta"]["is_ensemble"])
+        self.assertEqual(paths_ultra["meta"]["ensemble_keys"], ["wd-v3-eva02-large", "wd-v3-swinv2", "wd-v3-convnext"])
+        tagger_ultra = WD14Tagger("wd-v3-ultra-ensemble")
+        self.assertTrue(tagger_ultra.is_ensemble)
+        self.assertEqual(tagger_ultra.ensemble_keys, ["wd-v3-eva02-large", "wd-v3-swinv2", "wd-v3-convnext"])
 
 
 class TestDatabaseLayer(unittest.TestCase):
@@ -274,6 +289,25 @@ class TestAiTaggingWorker(unittest.TestCase):
         worker.stop()
         self.assertFalse(worker.running)
 
+    def test_worker_rescan_unknown_characters(self):
+        worker1 = AiTaggingWorker(
+            root_path=None,
+            db_file=self.temp_db_path,
+            use_gpu=False,
+            rescan_existing=False,
+            rescan_unknown_chars=False
+        )
+        self.assertFalse(worker1.rescan_unknown_chars)
+
+        worker2 = AiTaggingWorker(
+            root_path=None,
+            db_file=self.temp_db_path,
+            use_gpu=False,
+            rescan_existing=False,
+            rescan_unknown_chars=True
+        )
+        self.assertTrue(worker2.rescan_unknown_chars)
+
 class TestStreamScannerFiltering(unittest.TestCase):
     def setUp(self):
         self.temp_db_fd, self.temp_db_path = tempfile.mkstemp(suffix=".db")
@@ -354,6 +388,15 @@ class TestAiTagDialogUI(unittest.TestCase):
         self.assertEqual(dialog.combo_scan_mode.itemData(1), True)  # Full Re-scan (rescan=True)
         self.assertIsNotNone(dialog.slider_thresh)
         self.assertIsNotNone(dialog.progress_bar)
+
+        self.assertIsNotNone(dialog.chk_unknown_chars)
+        self.assertTrue(dialog.chk_unknown_chars.isEnabled())
+        # Changing to Full Re-scan should disable chk_unknown_chars
+        dialog.combo_scan_mode.setCurrentIndex(1)
+        self.assertFalse(dialog.chk_unknown_chars.isEnabled())
+        # Changing back to Quick Mode should re-enable it
+        dialog.combo_scan_mode.setCurrentIndex(0)
+        self.assertTrue(dialog.chk_unknown_chars.isEnabled())
 
         # Check default DirectML selection
         self.assertTrue(dialog.combo_provider.count() >= 2)
