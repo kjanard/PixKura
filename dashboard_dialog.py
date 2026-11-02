@@ -22,7 +22,7 @@ class AnalyticsWorker(QThread):
         self.finished.emit(data)
 
 
-from components import MinimizableDialog
+from components import MinimizableDialog, DuplicateFinderDialog, DatasetExporterDialog
 
 
 class DashboardDialog(MinimizableDialog):
@@ -37,7 +37,7 @@ class DashboardDialog(MinimizableDialog):
         super().__init__(parent)
         self.on_apply_query = on_apply_query
         self.setWindowTitle("📊 Library Visual Dashboard & Tag Cloud (สถิติคลังภาพและกลุ่มแท็ก)")
-        self.resize(920, 720)
+        self.resize(940, 720)
         self.setStyleSheet("""
             QDialog {
                 background-color: #121216;
@@ -152,6 +152,14 @@ class DashboardDialog(MinimizableDialog):
         header.addLayout(title_box)
         header.addStretch()
 
+        self.btn_duplicates = QPushButton("🔍 Find Duplicates")
+        self.btn_duplicates.clicked.connect(self.open_duplicate_finder)
+        header.addWidget(self.btn_duplicates)
+
+        self.btn_export_ds = QPushButton("📦 Export Dataset")
+        self.btn_export_ds.clicked.connect(self.open_dataset_exporter)
+        header.addWidget(self.btn_export_ds)
+
         self.btn_refresh = QPushButton("🔄 Refresh Data")
         self.btn_refresh.clicked.connect(self.load_data)
         header.addWidget(self.btn_refresh)
@@ -223,6 +231,10 @@ class DashboardDialog(MinimizableDialog):
 
         # Footer Actions
         footer = QHBoxLayout()
+        btn_view_fav = QPushButton("⭐ View Favorites (is:fav)")
+        btn_view_fav.clicked.connect(lambda: self.apply_query_and_close("is:fav"))
+        footer.addWidget(btn_view_fav)
+
         btn_view_sfw = QPushButton("🟢 View All SFW (ดูภาพปลอดภัย)")
         btn_view_sfw.clicked.connect(lambda: self.apply_query_and_close("rating:sfw"))
         footer.addWidget(btn_view_sfw)
@@ -239,6 +251,15 @@ class DashboardDialog(MinimizableDialog):
 
         # Trigger data loading
         self.load_data()
+
+    def open_duplicate_finder(self):
+        root = getattr(self.parent(), 'current_folder', None) if self.parent() else None
+        dlg = DuplicateFinderDialog(self, root_path=root, db_file=DB_FILE)
+        dlg.exec()
+
+    def open_dataset_exporter(self):
+        dlg = DatasetExporterDialog(self, db_file=DB_FILE)
+        dlg.exec()
 
     def create_kpi_card(self, title, val, sub, val_color="#f9fafb"):
         frame = QFrame()
@@ -267,7 +288,6 @@ class DashboardDialog(MinimizableDialog):
         tab_layout.setContentsMargins(12, 12, 12, 12)
         tab_layout.setSpacing(16)
 
-        # Left Column: Top Characters
         col_chars = QVBoxLayout()
         lbl_c = QLabel("👤 Top Characters (25 อันดับตัวละครที่มีภาพเยอะที่สุด)")
         lbl_c.setStyleSheet("font-size: 13px; font-weight: bold; color: #60a5fa; margin-bottom: 6px;")
@@ -283,7 +303,6 @@ class DashboardDialog(MinimizableDialog):
         col_chars.addWidget(scroll_c)
         tab_layout.addLayout(col_chars, 3)
 
-        # Right Column: Top Series
         col_series = QVBoxLayout()
         lbl_s = QLabel("📚 Top Series / Copyright (ซีรีส์ยอดนิยม)")
         lbl_s.setStyleSheet("font-size: 13px; font-weight: bold; color: #a78bfa; margin-bottom: 6px;")
@@ -332,12 +351,12 @@ class DashboardDialog(MinimizableDialog):
         tagged = data.get("tagged_files", 0)
         sfw = data.get("sfw_count", 0)
         nsfw = data.get("nsfw_count", 0)
+        favs = data.get("favorite_count", 0)
 
-        # Update KPI Cards
         self.card_files['val'].setText(f"{tot_files:,}")
-        self.card_files['sub'].setText(f"{tot_folders:,} Artist Folders")
+        self.card_files['sub'].setText(f"{tot_folders:,} Folders | ⭐ {favs:,} Favs")
 
-        coverage = (tagged / tot_files * 100) if tot_files > 0 else 0
+        coverage = min(100.0, (tagged / tot_files * 100)) if tot_files > 0 else 0
         self.card_tagged['val'].setText(f"{tagged:,}")
         self.card_tagged['sub'].setText(f"{coverage:.1f}% Coverage")
 
@@ -350,11 +369,9 @@ class DashboardDialog(MinimizableDialog):
         self.card_nsfw['val'].setText(f"{nsfw:,}")
         self.card_nsfw['sub'].setText(f"{nsfw_pct:.1f}% Adult Art")
 
-        # Update Safety Bar
         self.safety_bar.setValue(int(sfw_pct))
         self.lbl_safety_ratio.setText(f"🟢 SFW: {sfw:,} ({sfw_pct:.1f}%)  |  🔞 NSFW: {nsfw:,} ({nsfw_pct:.1f}%)")
 
-        # Populate Characters Leaderboard
         self.clear_layout(self.layout_chars)
         top_chars = data.get("top_characters", [])
         max_char_cnt = top_chars[0][1] if top_chars else 1
@@ -389,7 +406,6 @@ class DashboardDialog(MinimizableDialog):
             btn_char.clicked.connect(lambda checked, name=c_name: self.apply_query_and_close(f"char:{name}"))
             row_l.addWidget(btn_char, 1)
 
-            # Mini Bar
             bar = QProgressBar()
             bar.setRange(0, max_char_cnt)
             bar.setValue(cnt)
@@ -412,7 +428,6 @@ class DashboardDialog(MinimizableDialog):
 
         self.layout_chars.addStretch()
 
-        # Populate Top Series
         self.clear_layout(self.layout_series)
         top_series = data.get("top_series", [])
         for rank, (s_name, cnt) in enumerate(top_series, 1):
@@ -436,11 +451,9 @@ class DashboardDialog(MinimizableDialog):
             self.layout_series.addWidget(btn_s)
         self.layout_series.addStretch()
 
-        # Populate Tag Cloud
         self.clear_layout(self.layout_cloud)
         top_tags = data.get("top_tags", [])
         
-        # Grid of tag chips (4 columns)
         cols = 4
         for idx, (t_name, cnt) in enumerate(top_tags):
             is_hot = idx < 8
@@ -472,4 +485,3 @@ class DashboardDialog(MinimizableDialog):
         if hasattr(self, 'worker') and self.worker.isRunning():
             self.worker.wait(500)
         super().closeEvent(event)
-

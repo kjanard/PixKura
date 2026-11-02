@@ -63,7 +63,7 @@ def get_model_paths(model_key=DEFAULT_MODEL_KEY):
 class WD14Tagger:
     """
     Local AI Tagger supporting WD14 Tagger (v1.4), WD Tagger v3 Series, and Ensemble 3-in-1 in ONNX format.
-    Supports GPU acceleration via DirectML on Windows, FP16 Half-Precision (AMD RDNA / NVIDIA), and CPU fallback.
+    Supports GPU & NPU acceleration via DirectML, CUDA, OpenVINO, QNN, FP16 Half-Precision, and CPU fallback.
     """
     def __init__(self, model_key=DEFAULT_MODEL_KEY, model_path=None, tags_path=None, use_gpu=True, use_fp16=False):
         self.model_key = model_key or DEFAULT_MODEL_KEY
@@ -103,15 +103,20 @@ class WD14Tagger:
 
     @staticmethod
     def get_available_providers():
-        """Returns available ONNX execution providers and checks if DirectML is supported."""
+        """Returns available ONNX execution providers and checks GPU/NPU support."""
         all_providers = ort.get_available_providers()
         has_directml = 'DmlExecutionProvider' in all_providers
         has_cuda = 'CUDAExecutionProvider' in all_providers
+        has_openvino = 'OpenVINOExecutionProvider' in all_providers
+        has_qnn = 'QNNExecutionProvider' in all_providers
         return {
             "all_providers": all_providers,
             "has_directml": has_directml,
             "has_cuda": has_cuda,
-            "has_gpu": has_directml or has_cuda
+            "has_openvino": has_openvino,
+            "has_qnn": has_qnn,
+            "has_npu": has_openvino or has_qnn,
+            "has_gpu": has_directml or has_cuda or has_openvino or has_qnn
         }
 
     @classmethod
@@ -258,6 +263,14 @@ class WD14Tagger:
                         if progress_callback:
                             progress_callback(downloaded, total_size, f"กำลังดาวน์โหลด {meta['short_name']} ({filename})...")
 
+            if total_size > 0 and downloaded != total_size:
+                if os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except OSError:
+                        pass
+                raise IOError(f"ดาวน์โหลดไฟล์ {filename} ไม่สมบูรณ์ ({downloaded}/{total_size} bytes)")
+
             if os.path.exists(dest_path):
                 os.remove(dest_path)
             os.rename(temp_path, dest_path)
@@ -315,7 +328,7 @@ class WD14Tagger:
         logging.info(f"Loaded {len(self.tags_data)} tags ({len(self.char_indices)} characters, {len(self.series_indices)} series).")
 
     def load_model(self):
-        """Initializes ONNX Runtime InferenceSession with DirectML GPU or CPU."""
+        """Initializes ONNX Runtime InferenceSession with DirectML/CUDA/NPU or CPU."""
         if self.is_ensemble:
             self.sub_taggers = []
             for k in self.ensemble_keys:
@@ -340,10 +353,9 @@ class WD14Tagger:
         providers = []
         if self.use_gpu:
             available = ort.get_available_providers()
-            if 'DmlExecutionProvider' in available:
-                providers.append('DmlExecutionProvider')
-            elif 'CUDAExecutionProvider' in available:
-                providers.append('CUDAExecutionProvider')
+            for ep in ('DmlExecutionProvider', 'CUDAExecutionProvider', 'OpenVINOExecutionProvider', 'QNNExecutionProvider'):
+                if ep in available:
+                    providers.append(ep)
         
         providers.append('CPUExecutionProvider')
 
@@ -648,6 +660,3 @@ class WD14Tagger:
             })
 
         return results
-
-
-

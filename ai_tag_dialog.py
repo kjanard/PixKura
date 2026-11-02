@@ -1,5 +1,6 @@
 import os
 import time
+import html
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QProgressBar, QTextEdit, QSlider, QCheckBox, QComboBox,
@@ -10,7 +11,7 @@ from PyQt6.QtGui import QFont, QColor, QIcon, QPixmap
 
 from config import (
     DB_FILE, DEFAULT_CHARACTER_THRESHOLD, DEFAULT_GENERAL_THRESHOLD,
-    AVAILABLE_AI_MODELS, DEFAULT_MODEL_KEY
+    AVAILABLE_AI_MODELS, DEFAULT_MODEL_KEY, load_app_config
 )
 from tagger import WD14Tagger, get_model_paths
 from workers import AiTaggingWorker
@@ -80,15 +81,13 @@ class AiTagDialog(MinimizableDialog):
             self.library_root = initial_root_path
         else:
             try:
-                import json
-                with open('config.json', 'r', encoding='utf-8') as f:
-                    self.library_root = json.load(f).get('last_folder')
+                self.library_root = load_app_config().get('last_folder')
             except Exception:
                 pass
         
         self.setWindowTitle("🤖 AI Character & Tag Scanner (WD14 Tagger)")
-        self.resize(780, 680)
-        self.setMinimumSize(640, 520)
+        self.resize(780, 720)
+        self.setMinimumSize(640, 540)
         
         self.init_ui()
         self.check_system_status()
@@ -112,11 +111,11 @@ class AiTagDialog(MinimizableDialog):
         h_layout = QVBoxLayout(header_card)
         h_layout.setContentsMargins(10, 8, 10, 8)
         
-        title_label = QLabel("✨ AI Character & Tag Classifier (Local DirectML / GPU)")
+        title_label = QLabel("✨ AI Character & Tag Classifier (Local DirectML / CUDA / NPU)")
         title_label.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
         title_label.setStyleSheet("color: #38bdf8;")
         
-        self.desc_label = QLabel("ระบบวิเคราะห์ตัวละครและแท็กข้อมูลภาพอัตโนมัติด้วย AI ในเครื่อง (รองรับ NVIDIA, AMD, Intel GPU)")
+        self.desc_label = QLabel("ระบบวิเคราะห์ตัวละครและแท็กข้อมูลภาพอัตโนมัติด้วย AI ในเครื่อง (รองรับ NVIDIA, AMD, Intel GPU & NPU)")
         self.desc_label.setFont(QFont("Segoe UI", 9))
         self.desc_label.setStyleSheet("color: #94a3b8;")
         
@@ -221,7 +220,6 @@ class AiTagDialog(MinimizableDialog):
         scope_row.addWidget(self.btn_browse_artist)
         settings_layout.addLayout(scope_row)
 
-
         # Scan Mode Row (Quick Mode vs Full Re-scan)
         mode_row = QHBoxLayout()
         lbl_mode = QLabel("โหมดการสแกน (Scan Mode):")
@@ -250,16 +248,29 @@ class AiTagDialog(MinimizableDialog):
         thresh_row.addWidget(self.lbl_thresh_val)
         settings_layout.addLayout(thresh_row)
 
-        # Precision Mode Row
+        # Precision & Batch Size Row
         prec_row = QHBoxLayout()
         lbl_prec = QLabel("ความแม่นยำ (Precision):")
         lbl_prec.setStyleSheet("color: #94a3b8;")
         self.combo_prec = QComboBox()
         self.combo_prec.setStyleSheet("background-color: #1e293b; color: white; border: 1px solid #475569; padding: 4px; border-radius: 4px;")
-        self.combo_prec.addItem("⚡ FP16 Half-Precision (เร็วที่สุด - แนะนำสำหรับ AMD Radeon / NVIDIA RTX)", True)
+        self.combo_prec.addItem("⚡ FP16 Half-Precision (เร็วที่สุด - แนะนำสำหรับ AMD / NVIDIA)", True)
         self.combo_prec.addItem("🔹 FP32 Standard (Full Precision 32-bit)", False)
+
+        lbl_batch = QLabel("Batch Size:")
+        lbl_batch.setStyleSheet("color: #94a3b8; margin-left: 8px;")
+        self.combo_batch = QComboBox()
+        self.combo_batch.setStyleSheet("background-color: #1e293b; color: white; border: 1px solid #475569; padding: 4px; border-radius: 4px;")
+        self.combo_batch.addItem("Batch = 4 (Low VRAM)", 4)
+        self.combo_batch.addItem("Batch = 8 (Balanced)", 8)
+        self.combo_batch.addItem("Batch = 16 (Recommended)", 16)
+        self.combo_batch.addItem("Batch = 32 (High VRAM)", 32)
+        self.combo_batch.setCurrentIndex(2)
+
         prec_row.addWidget(lbl_prec)
         prec_row.addWidget(self.combo_prec, 1)
+        prec_row.addWidget(lbl_batch)
+        prec_row.addWidget(self.combo_batch)
         settings_layout.addLayout(prec_row)
 
         # Storage Drive Profile Row (Auto Detect HDD / SSD)
@@ -418,16 +429,21 @@ class AiTagDialog(MinimizableDialog):
 
     def check_system_status(self):
         """Checks model availability and hardware execution providers."""
-        # 1. Check Hardware
         providers_info = WD14Tagger.get_available_providers()
         self.combo_provider.clear()
         
-        if providers_info["has_directml"]:
+        if providers_info.get("has_directml"):
             self.combo_provider.addItem("🚀 GPU Acceleration (DirectML - NVIDIA / AMD / Intel)", True)
             self.lbl_hw_info.setText("✅ GPU DirectML พร้อมใช้งาน")
-        elif providers_info["has_cuda"]:
+        elif providers_info.get("has_cuda"):
             self.combo_provider.addItem("🚀 GPU Acceleration (NVIDIA CUDA)", True)
             self.lbl_hw_info.setText("✅ GPU CUDA พร้อมใช้งาน")
+        elif providers_info.get("has_openvino"):
+            self.combo_provider.addItem("🧠 NPU / GPU Acceleration (Intel OpenVINO)", True)
+            self.lbl_hw_info.setText("✅ Intel OpenVINO พร้อมใช้งาน")
+        elif providers_info.get("has_qnn"):
+            self.combo_provider.addItem("🧠 NPU Acceleration (Qualcomm QNN)", True)
+            self.lbl_hw_info.setText("✅ Qualcomm QNN NPU พร้อมใช้งาน")
         else:
             self.lbl_hw_info.setText("⚠️ ไม่พบ GPU ที่รองรับ")
         
@@ -459,9 +475,7 @@ class AiTagDialog(MinimizableDialog):
         target_root = self.combo_scope.currentData() if hasattr(self, 'combo_scope') else None
         if not target_root:
             try:
-                import json
-                with open('config.json', 'r', encoding='utf-8') as f:
-                    target_root = json.load(f).get('last_folder', '')
+                target_root = load_app_config().get('last_folder', '')
             except Exception:
                 target_root = ''
 
@@ -576,7 +590,6 @@ class AiTagDialog(MinimizableDialog):
         if folder:
             name = os.path.basename(folder)
             item_text = f"👤 โฟลเดอร์: {name}"
-            # Check if item already exists in combo
             idx = self.combo_scope.findData(folder)
             if idx >= 0:
                 self.combo_scope.setCurrentIndex(idx)
@@ -593,7 +606,6 @@ class AiTagDialog(MinimizableDialog):
         use_gpu = self.combo_provider.currentData()
         providers_info = WD14Tagger.get_available_providers()
 
-        # Check if user requested GPU but DirectML is missing
         if use_gpu and not providers_info["has_gpu"]:
             reply = QMessageBox.warning(
                 self, "ไม่พบ GPU",
@@ -613,6 +625,7 @@ class AiTagDialog(MinimizableDialog):
         use_fp16 = self.combo_prec.currentData()
         storage_mode = self.combo_storage.currentData() or "auto"
         model_key = self.combo_model.currentData() or DEFAULT_MODEL_KEY
+        inf_batch = self.combo_batch.currentData() or 16
 
         self.btn_start.setEnabled(False)
         self.btn_pause.setEnabled(True)
@@ -622,6 +635,7 @@ class AiTagDialog(MinimizableDialog):
         self.combo_scope.setEnabled(False)
         self.combo_provider.setEnabled(False)
         self.combo_prec.setEnabled(False)
+        self.combo_batch.setEnabled(False)
         self.combo_storage.setEnabled(False)
         self.combo_scan_mode.setEnabled(False)
         self.slider_thresh.setEnabled(False)
@@ -642,7 +656,8 @@ class AiTagDialog(MinimizableDialog):
             storage_mode=storage_mode,
             char_threshold=char_thresh,
             gen_threshold=char_thresh,
-            rescan_existing=rescan
+            rescan_existing=rescan,
+            inference_batch=inf_batch
         )
         self.worker.signals.progress.connect(self.on_scan_progress)
         self.worker.signals.item_tagged.connect(self.on_item_tagged)
@@ -690,15 +705,14 @@ class AiTagDialog(MinimizableDialog):
 
     @pyqtSlot(str, list, list, list, str)
     def on_item_tagged(self, path, chars, series, general, rating):
-        fname = os.path.basename(path)
-        char_text = ", ".join([f"{c[0]} ({int(c[1]*100)}%)" for c in chars]) if chars else "Unknown Character"
-        series_text = f" [{series[0][0]}]" if series else ""
+        fname = html.escape(os.path.basename(path))
+        char_text = ", ".join([f"{html.escape(str(c[0]))} ({int(c[1]*100)}%)" for c in chars]) if chars else "Unknown Character"
+        series_text = f" [{html.escape(str(series[0][0]))}]" if series else ""
         self.lbl_current_detected.setText(f"🏷️ <b>{fname}</b>: <span style='color:#38bdf8;'>{char_text}{series_text}</span>")
 
     @pyqtSlot(str)
     def on_scan_log(self, text):
         self.log_text.append(text)
-        # Scroll to bottom
         sb = self.log_text.verticalScrollBar()
         sb.setValue(sb.maximum())
 
@@ -712,12 +726,12 @@ class AiTagDialog(MinimizableDialog):
         self.combo_scope.setEnabled(True)
         self.combo_provider.setEnabled(True)
         self.combo_prec.setEnabled(True)
+        self.combo_batch.setEnabled(True)
         self.combo_storage.setEnabled(True)
         self.combo_scan_mode.setEnabled(True)
         self.slider_thresh.setEnabled(True)
         self.lbl_speed.setText("ความเร็ว: 0.0 FPS")
 
-        # Format final elapsed time stopwatch
         mins, secs = divmod(int(elapsed), 60)
         hrs, mins = divmod(mins, 60)
         if hrs > 0:

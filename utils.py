@@ -11,8 +11,39 @@ from PIL import Image, PngImagePlugin, ImageFile, ImageDraw
 PngImagePlugin.MAX_TEXT_CHUNK = 104857600  # 100MB to allow large metadata chunks in AI-generated PNGs
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QPixmap, QRegion, QPainterPath, QImage, QFont
-from PyQt6.QtCore import Qt, QRect
-from config import EXT_IMG, EXT_GIF, EXT_VID, EXT_ZIP
+from PyQt6.QtCore import Qt, QRect, QTimer
+from config import EXT_IMG, EXT_GIF, EXT_VID, EXT_ZIP, MAX_UGOIRA_FRAME_BYTES
+
+
+def safe_single_shot(ms: int, widget_or_fn, callback=None):
+    """
+    Safely schedules a QTimer.singleShot callback that touches a Qt widget.
+    Prevents 'RuntimeError: wrapped C/C++ object of type QPushButton has been deleted'
+    when the user closes a dialog before the timer expires.
+    Can be called as:
+      safe_single_shot(1500, btn, lambda: btn.setText("..."))
+    or:
+      safe_single_shot(1500, lambda: btn.setText("..."))
+    """
+    if callback is None:
+        fn = widget_or_fn
+        widget = None
+    else:
+        widget = widget_or_fn
+        fn = callback
+
+    def _wrapped():
+        try:
+            if widget is not None:
+                # Check if C++ object is still alive by calling a lightweight QObject method
+                _ = widget.isVisible()
+            fn()
+        except RuntimeError:
+            pass
+        except Exception as e:
+            logging.debug(f"Ignored timer callback exception: {e}")
+
+    QTimer.singleShot(ms, _wrapped)
 
 
 def show_in_file_manager(file_path: str) -> bool:
@@ -35,7 +66,8 @@ def show_in_file_manager(file_path: str) -> bool:
                 return False
 
         if sys.platform == 'win32':
-            norm_p = os.path.normpath(p)
+            # Sanitize against quote injection while preserving Windows path format
+            norm_p = os.path.normpath(p).replace('"', '')
             if os.path.isfile(norm_p):
                 # Windows Explorer command syntax: explorer.exe /select,"<path>"
                 # Quotes must surround ONLY the path, not the /select switch
@@ -76,6 +108,7 @@ def add_indicator(pixmap, file_type):
     painter.end()
     return pixmap
 
+
 def load_media_thumbnail(path):
     if not os.path.exists(path):
         return None, None
@@ -88,8 +121,11 @@ def load_media_thumbnail(path):
             return Image.new('RGB', (240, 240), (0,0,0)), 'VIDEO'
         elif ext in EXT_ZIP:
             with zipfile.ZipFile(path, 'r') as z:
-                l = sorted([f for f in z.namelist() if f.lower().endswith(tuple(EXT_IMG))])
+                l = sorted([f for f in z.namelist() if f.lower().endswith(tuple(EXT_IMG)) and not f.startswith('__MACOSX')])
                 if l:
+                    info = z.getinfo(l[0])
+                    if info.file_size > MAX_UGOIRA_FRAME_BYTES:
+                        raise ValueError(f"Archive member exceeds safe size limit ({info.file_size} bytes)")
                     with z.open(l[0]) as zf:
                         with Image.open(zf) as raw_img:
                             return raw_img.copy(), 'UGOIRA'
@@ -100,7 +136,6 @@ def load_media_thumbnail(path):
             with Image.open(path) as raw_img:
                 return raw_img.copy(), None
     except Exception as e:
-        import logging
         logging.error(f"Error loading media {path}: {e}")
         # Return a red placeholder indicating corrupt/unreadable file
         err_img = Image.new('RGB', (240, 240), (80, 20, 20))
@@ -152,6 +187,41 @@ def make_thumbnail_rgb(pil_img, max_size=(240, 240)):
         return rgb
 
 
+def compute_dhash(pil_img, hash_size=8) -> str:
+    """
+    Computes a 64-bit Difference Perceptual Hash (dHash) as a 16-char hex string.
+    Accepts either a PIL.Image.Image or a file path string.
+    Fast and resilient to rescaling, aspect ratio tweaks, and recompression (.jpg vs .png).
+    """
+    if not pil_img:
+        return ""
+    try:
+        if isinstance(pil_img, (str, bytes, os.PathLike)):
+            pil_img, ftype = load_media_thumbnail(str(pil_img))
+            if not pil_img or ftype == 'ERROR':
+                return ""
+        gray = pil_img.convert('L').resize((hash_size + 1, hash_size), Image.Resampling.BILINEAR)
+        pixels = gray.tobytes()
+        bits = 0
+        for row in range(hash_size):
+            row_offset = row * (hash_size + 1)
+            for col in range(hash_size):
+                bits = (bits << 1) | (1 if pixels[row_offset + col] > pixels[row_offset + col + 1] else 0)
+        return f"{bits:016x}"
+    except Exception:
+        return ""
+
+
+def hamming_distance_hex(hash1: str, hash2: str) -> int:
+    """Returns bit-level Hamming distance between two 64-bit hex dHashes."""
+    if not hash1 or not hash2 or len(hash1) != len(hash2):
+        return 64
+    try:
+        return (int(hash1, 16) ^ int(hash2, 16)).bit_count()
+    except Exception:
+        return 64
+
+
 def format_size(size_bytes):
     if size_bytes == 0: return "0B"
     size_name = ("B", "KB", "MB", "GB")
@@ -160,6 +230,7 @@ def format_size(size_bytes):
         size_bytes /= 1024.0
         i += 1
     return f"{size_bytes:.1f} {size_name[i]}"
+
 
 def overlay_avatar_on_grid(grid_qimg, avatar_blob):
     """
@@ -178,8 +249,6 @@ def overlay_avatar_on_grid(grid_qimg, avatar_blob):
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
     # 3. กำหนดขนาดและตำแหน่ง
-    # Grid ขนาดปกติคือ 240x240
-    # เราจะให้ Avatar ขนาด 60x60 (1/4 ของความกว้าง)
     icon_size = 60 
     margin = 5
     x, y = margin, margin
@@ -191,7 +260,6 @@ def overlay_avatar_on_grid(grid_qimg, avatar_blob):
     painter.drawEllipse(x, y, icon_size, icon_size)
 
     # 5. วาดรูป Avatar ลงในวงกลม
-    # สร้าง Path วงกลมสำหรับ Clip
     path = QPainterPath()
     path.addEllipse(x + border_size, y + border_size, icon_size - (border_size*2), icon_size - (border_size*2))
     painter.setClipPath(path)
@@ -201,6 +269,7 @@ def overlay_avatar_on_grid(grid_qimg, avatar_blob):
 
     painter.end()
     return result
+
 
 _DRIVE_MEDIA_CACHE = {}
 _DRIVE_CACHE_TIME = 0.0
@@ -268,6 +337,7 @@ def get_drive_media_type_win32(drive_letter):
         pass
     return 'UNKNOWN'
 
+
 def get_all_drive_media_types(force_refresh=False):
     """
     Detects physical disk media type (SSD vs HDD) for all mounted drive letters on Windows.
@@ -290,6 +360,7 @@ def get_all_drive_media_types(force_refresh=False):
     _DRIVE_CACHE_TIME = time.time()
     return drive_map
 
+
 def detect_drive_media_type(path):
     """
     Detects whether the given path resides on an SSD or HDD.
@@ -308,4 +379,38 @@ def detect_drive_media_type(path):
 
     # 2. Fallback to cached all-drives mapping
     drive_map = get_all_drive_media_types()
-    return drive_map.get(drive, 'UNKNOWN')
+    return drive_map.get(drive, 'UNKNOWN')
+
+
+def detect_ai_accelerators() -> dict:
+    """
+    Discovers available AI hardware accelerators (DirectML GPU, CUDA, OpenVINO NPU, QNN NPU, Hailo PCIe).
+    Implements Phase 1 of future_plan.md without blocking the UI thread.
+    """
+    info = {
+        "has_directml": False,
+        "has_cuda": False,
+        "has_openvino": False,
+        "has_qnn": False,
+        "has_hailo": False,
+        "providers": []
+    }
+    try:
+        import onnxruntime as ort
+        providers = ort.get_available_providers()
+        info["providers"] = providers
+        info["has_directml"] = "DmlExecutionProvider" in providers
+        info["has_cuda"] = "CUDAExecutionProvider" in providers or "TensorrtExecutionProvider" in providers
+        info["has_openvino"] = "OpenVINOExecutionProvider" in providers
+        info["has_qnn"] = "QNNExecutionProvider" in providers
+    except Exception:
+        pass
+
+    try:
+        import importlib.util
+        if importlib.util.find_spec("hailo_platform") is not None:
+            info["has_hailo"] = True
+    except Exception:
+        pass
+
+    return info

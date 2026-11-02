@@ -1,13 +1,17 @@
 @echo off
-title PixKura Bootstrapper
+title PixKura Bootstrapper v2.4.0
 cd /d "%~dp0"
 
-:: [โหมด Debug/Console] หากเปิดด้วย --console หรือ -c หรือ --debug จะแสดงหน้าต่าง Terminal เพื่อดู Log
-if "%~1"=="--console" goto run_console
-if "%~1"=="-c" goto run_console
-if "%~1"=="--debug" goto run_console
+:: [Test Mode] Run automated unit test suite in tests/ directory
+if /I "%~1"=="--test" goto run_tests
+if /I "%~1"=="-t" goto run_tests
 
-:: 1. ตรวจสอบ Virtual Environment ในโฟลเดอร์โปรเจกต์ (.venv หรือ venv)
+:: [Debug/Console Mode] Launch with terminal output for live debugging
+if /I "%~1"=="--console" goto run_console
+if /I "%~1"=="-c" goto run_console
+if /I "%~1"=="--debug" goto run_console
+
+:: 1. Check Virtual Environment in project folder (.venv or venv)
 if exist ".venv\Scripts\pythonw.exe" (
     start "" ".venv\Scripts\pythonw.exe" main.py %*
     exit
@@ -17,21 +21,21 @@ if exist "venv\Scripts\pythonw.exe" (
     exit
 )
 
-:: 2. ตรวจสอบและใช้งาน pythonw จาก PATH (รันเบื้องหลัง ไม่มีหน้าต่างดำกวนใจ)
+:: 2. Check pythonw in PATH (background launch without console window)
 where pythonw >nul 2>nul
 if %errorlevel% equ 0 (
     start "" pythonw main.py %*
     exit
 )
 
-:: 3. ตรวจสอบ Windows Python Launcher (pyw)
+:: 3. Check Windows Python Launcher (pyw)
 where pyw >nul 2>nul
 if %errorlevel% equ 0 (
     start "" pyw main.py %*
     exit
 )
 
-:: 4. ตรวจสอบโฟลเดอร์ Python ใน Local AppData ของ Windows (รองรับ Python 3.10 - 3.13+)
+:: 4. Check Local AppData Python installations (Python 3.9 - 3.13+)
 for /d %%D in ("%USERPROFILE%\AppData\Local\Programs\Python\Python3*") do (
     if exist "%%D\pythonw.exe" (
         start "" "%%D\pythonw.exe" main.py %*
@@ -43,24 +47,33 @@ for /d %%D in ("%USERPROFILE%\AppData\Local\Programs\Python\Python3*") do (
     )
 )
 
-:: 5. ตรวจสอบและใช้งาน python ปกติ (กรณีไม่มี pythonw)
+:: 5. Fallback to standard python in PATH
 where python >nul 2>nul
 if %errorlevel% equ 0 (
     start "" python main.py %*
     exit
 )
 
-:: กรณีเกิดข้อผิดพลาด: ไม่พบ Python ในเครื่อง
+:: Error: Python not found
 echo ========================================================
-echo ERROR: ไม่พบ Python ติดตั้งอยู่ในระบบของคุณ
-echo กรุณาติดตั้ง Python (แนะนำ 3.10 - 3.12) และติ๊ก "Add Python to PATH"
+echo ERROR: Python was not found on your system.
+echo Please install Python 3.10 - 3.12 and enable "Add Python to PATH".
 echo ========================================================
 pause
 exit /b 1
 
-:: โหมดรันพร้อมหน้าต่าง Console เพื่อดู Log ข้อผิดพลาด
 :run_console
 echo [*] Launching PixKura in Console / Debug mode...
+if exist ".venv\Scripts\python.exe" (
+    ".venv\Scripts\python.exe" main.py %*
+    pause
+    exit
+)
+if exist "venv\Scripts\python.exe" (
+    "venv\Scripts\python.exe" main.py %*
+    pause
+    exit
+)
 where python >nul 2>nul
 if %errorlevel% equ 0 (
     python main.py %*
@@ -70,3 +83,21 @@ if %errorlevel% equ 0 (
 py main.py %*
 pause
 exit
+
+:run_tests
+echo [*] Running PixKura Automated Unit Test Suite (tests/)...
+if exist ".venv\Scripts\python.exe" (
+    ".venv\Scripts\python.exe" -m unittest discover -s tests -p "test_*.py" -v
+    exit /b %errorlevel%
+)
+if exist "venv\Scripts\python.exe" (
+    "venv\Scripts\python.exe" -m unittest discover -s tests -p "test_*.py" -v
+    exit /b %errorlevel%
+)
+where python >nul 2>nul
+if %errorlevel% equ 0 (
+    python -m unittest discover -s tests -p "test_*.py" -v
+    exit /b %errorlevel%
+)
+py -m unittest discover -s tests -p "test_*.py" -v
+exit /b %errorlevel%

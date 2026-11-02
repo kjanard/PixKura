@@ -2,9 +2,20 @@ import unittest
 import sqlite3
 import os
 import sys
+import tempfile
+
+# Ensure workspace root is in sys.path
+WORKSPACE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if WORKSPACE_DIR not in sys.path:
+    sys.path.insert(0, WORKSPACE_DIR)
 
 from query_parser import parse_search_query, resolve_matching_paths, SearchQuery
-from config import DB_FILE
+from config import DB_FILE, encrypt_secret, decrypt_secret, load_app_config, update_app_config
+from database import (
+    DatabaseSetup, is_file_favorite, toggle_file_favorite,
+    add_custom_file_tag, remove_file_tag, cleanup_orphaned_records,
+    get_file_tags
+)
 
 class TestQueryParser(unittest.TestCase):
     def test_parse_rating(self):
@@ -28,6 +39,17 @@ class TestQueryParser(unittest.TestCase):
         self.assertIn("miku", q.include_chars)
         self.assertIn("blue_archive", q.include_series)
         self.assertIn("glasses", q.exclude_tags)
+
+    def test_parse_artist_and_favorites(self):
+        q = parse_search_query('artist:ask -artist:deleted_user is:fav type:mp4')
+        self.assertIn("ask", q.include_artists)
+        self.assertIn("deleted_user", q.exclude_artists)
+        self.assertTrue(q.only_favorites)
+        self.assertIn("mp4", q.file_types)
+
+        q2 = parse_search_query("is:favorite author:kurito")
+        self.assertTrue(q2.only_favorites)
+        self.assertIn("kurito", q2.include_artists)
 
     def test_parse_size_and_type(self):
         q = parse_search_query("type:gif size:>5mb")
@@ -102,6 +124,91 @@ class TestQueryParser(unittest.TestCase):
         self.assertIn("miku", q3.exclude_chars)
         self.assertIn("luka", q3.exclude_chars)
 
+    def test_resolve_artist_favorites_and_orphans_on_temp_db(self):
+        fd, temp_db = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            DatabaseSetup(temp_db)
+            conn = sqlite3.connect(temp_db)
+            cur = conn.cursor()
+            cur.execute("INSERT INTO artists (artist_id, name) VALUES ('12345', 'Ask_Art')")
+            cur.execute("INSERT INTO file_index (path, filename, parent_folder, mtime, size) VALUES (?, ?, ?, ?, ?)",
+                        ("D:\\Pixiv\\12345\\img1.png", "img1.png", "D:\\Pixiv\\12345", 100.0, 2048))
+            cur.execute("INSERT INTO file_index (path, filename, parent_folder, mtime, size) VALUES (?, ?, ?, ?, ?)",
+                        ("D:\\Pixiv\\99999\\img2.png", "img2.png", "D:\\Pixiv\\99999", 100.0, 2048))
+            # Insert an orphaned tag row not in file_index
+            cur.execute("INSERT INTO file_tags (path, tag_name, category, confidence) VALUES (?, ?, ?, ?)",
+                        ("D:\\Pixiv\\deleted\\ghost.png", "1girl", 0, 0.99))
+            conn.commit()
+            conn.close()
+
+            # Test favorite toggle & custom tag
+            self.assertFalse(is_file_favorite(temp_db, "D:\\Pixiv\\12345\\img1.png"))
+            new_state = toggle_file_favorite(temp_db, "D:\\Pixiv\\12345\\img1.png")
+            self.assertTrue(new_state)
+            self.assertTrue(is_file_favorite(temp_db, "D:\\Pixiv\\12345\\img1.png"))
+
+            self.assertTrue(add_custom_file_tag(temp_db, "D:\\Pixiv\\12345\\img1.png", "wallpaper masterpiece"))
+            tags_info = get_file_tags(temp_db, "D:\\Pixiv\\12345\\img1.png")
+            self.assertTrue(tags_info["is_favorite"])
+            self.assertIn(("wallpaper_masterpiece", 1.0), tags_info["custom"])
+
+            conn = sqlite3.connect(temp_db)
+            try:
+                # Resolve artist:ask_art
+                q_art = parse_search_query("artist:ask_art")
+                art_paths = resolve_matching_paths(conn, q_art)
+                self.assertEqual(art_paths, {"D:\\Pixiv\\12345\\img1.png"})
+
+                # Resolve is:fav
+                q_fav = parse_search_query("is:fav")
+                fav_paths = resolve_matching_paths(conn, q_fav)
+                self.assertEqual(fav_paths, {"D:\\Pixiv\\12345\\img1.png"})
+
+                # Resolve custom tag
+                q_custom = parse_search_query("tag:wallpaper_masterpiece")
+                custom_paths = resolve_matching_paths(conn, q_custom)
+                self.assertEqual(custom_paths, {"D:\\Pixiv\\12345\\img1.png"})
+            finally:
+                conn.close()
+
+            # Test orphan cleanup
+            removed = cleanup_orphaned_records(temp_db)
+            self.assertGreaterEqual(removed["orphaned_tags"], 1)
+
+            # Remove custom tag
+            self.assertTrue(remove_file_tag(temp_db, "D:\\Pixiv\\12345\\img1.png", "wallpaper_masterpiece"))
+        finally:
+            if os.path.exists(temp_db):
+                try: os.remove(temp_db)
+                except Exception: pass
+
+    def test_dpapi_secret_encryption_and_atomic_config(self):
+        secret = "12345678_secret_pixiv_phpsessid_token"
+        enc = encrypt_secret(secret)
+        if os.name == "nt":
+            self.assertTrue(enc.startswith("dpapi:"), "Should encrypt with Windows DPAPI prefix on Windows")
+            self.assertNotEqual(enc, secret)
+        dec = decrypt_secret(enc)
+        self.assertEqual(dec, secret)
+
+        # Plaintext backward compatibility
+        self.assertEqual(decrypt_secret("plain_legacy_value"), "plain_legacy_value")
+
+        # Atomic config read/write test on temporary file
+        fd, temp_cfg = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        try:
+            ok = update_app_config({"pixiv_cookie": secret, "custom_key": 42}, config_path=temp_cfg)
+            self.assertTrue(ok)
+            loaded = load_app_config(config_path=temp_cfg)
+            self.assertEqual(loaded.get("pixiv_cookie"), secret)
+            self.assertEqual(loaded.get("custom_key"), 42)
+        finally:
+            if os.path.exists(temp_cfg):
+                try: os.remove(temp_cfg)
+                except Exception: pass
+
     def test_db_resolve_matching_paths(self):
         if not os.path.exists(DB_FILE):
             self.skipTest("Database file not found.")
@@ -135,3 +242,4 @@ class TestQueryParser(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

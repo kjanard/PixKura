@@ -1,17 +1,22 @@
+import os
 import re
 import secrets
 import hashlib
 import base64
+import sqlite3
 import requests
 from urllib.parse import urlparse, parse_qs
 from PyQt6.QtWidgets import (
     QListWidgetItem, QDialog, QVBoxLayout, QPushButton, QTextEdit, 
-    QLabel, QMessageBox, QLineEdit, QHBoxLayout, QWidget, QApplication
+    QLabel, QMessageBox, QLineEdit, QHBoxLayout, QWidget, QApplication,
+    QProgressBar, QCheckBox, QComboBox, QFileDialog, QSlider, QListWidget,
+    QGroupBox, QAbstractItemView
 )
-from PyQt6.QtCore import Qt, QUrl, QTimer, QRectF, QEvent
+from PyQt6.QtCore import Qt, QUrl, QTimer, QRectF, QEvent, QThreadPool
 from PyQt6.QtGui import QDesktopServices, QPainter, QColor
 
-from config import AppConfig
+from config import AppConfig, DB_FILE
+from utils import format_size, show_in_file_manager
 
 class NaturalSortItem(QListWidgetItem):
     sort_mode = 0 
@@ -67,11 +72,10 @@ class LoadingSpinner(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         
-        # Translate origin to center of widget
         painter.translate(self.width() / 2, self.height() / 2)
         painter.rotate(self.angle)
         
-        color = QColor("#3b82f6")  # Modern electric blue
+        color = QColor("#3b82f6")
         for i in range(12):
             painter.setPen(Qt.PenStyle.NoPen)
             alpha = int(255 * (i / 11))
@@ -163,7 +167,7 @@ class SearchHelpDialog(MinimizableDialog):
         super().__init__(parent)
         self.on_apply_query = on_apply_query
         self.setWindowTitle("❓ Search Syntax Guide & Safety Help (คู่มือการค้นหาและความปลอดภัย)")
-        self.resize(720, 620)
+        self.resize(740, 640)
         self.setStyleSheet("""
             QDialog {
                 background-color: #121216;
@@ -224,17 +228,15 @@ class SearchHelpDialog(MinimizableDialog):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
 
-        # Header Title
         title_label = QLabel("🔍 PixKura Search & Safety Engine")
         title_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #60a5fa;")
         layout.addWidget(title_label)
 
-        sub_label = QLabel("รองรับการค้นหาแบบ Danbooru Boolean Query (AND, OR, NOT), การคัดกรองเรตติ้งความปลอดภัย และประเภท/ขนาดไฟล์")
+        sub_label = QLabel("รองรับการค้นหาแบบ Danbooru Boolean Query (AND, OR, NOT), รายการโปรด (is:fav), การคัดกรองเรตติ้งความปลอดภัย และประเภท/ขนาดไฟล์")
         sub_label.setStyleSheet("font-size: 12px; color: #9ca3af;")
         sub_label.setWordWrap(True)
         layout.addWidget(sub_label)
 
-        # Rich text documentation
         doc_view = QTextEdit()
         doc_view.setReadOnly(True)
         doc_html = """
@@ -249,10 +251,15 @@ class SearchHelpDialog(MinimizableDialog):
             td { padding: 6px; border-bottom: 1px solid #1f2937; }
         </style>
 
-        <h3>🛡️ 1. Safety & Rating Filters (การคัดกรองความปลอดภัย)</h3>
+        <h3>🛡️ 1. Safety, Favorites & Rating Filters (ความปลอดภัยและรายการโปรด)</h3>
         <p>สามารถเลือกจากช่อง <b>Safety</b> ในแถบเครื่องมือ หรือพิมพ์คีย์เวิร์ดในช่องค้นหา:</p>
         <table>
             <tr><th>คำสั่ง</th><th>ประเภท</th><th>คำอธิบาย</th></tr>
+            <tr>
+                <td><code>is:fav</code> หรือ <code>is:favorite</code></td>
+                <td><span class="badge-sens">⭐ FAVORITES</span></td>
+                <td>แสดงเฉพาะภาพที่กดติดดาวรายการโปรดไว้ (กดปุ่ม ⭐ หรือปุ่มลัด <code>S</code> ใน Lightbox)</td>
+            </tr>
             <tr>
                 <td><code>rating:sfw</code> หรือ <code>is:sfw</code></td>
                 <td><span class="badge-sfw">🟢 SFW ONLY</span></td>
@@ -275,7 +282,7 @@ class SearchHelpDialog(MinimizableDialog):
             </tr>
         </table>
 
-        <h3>👤 2. Characters & Series (ตัวละครและซีรีส์)</h3>
+        <h3>👤 2. Characters, Series & Artists (ตัวละคร ซีรีส์ และนักวาด)</h3>
         <table>
             <tr><th>ไวยากรณ์</th><th>ตัวอย่าง</th><th>ผลลัพธ์</th></tr>
             <tr>
@@ -291,7 +298,7 @@ class SearchHelpDialog(MinimizableDialog):
             <tr>
                 <td><code>artist:name</code></td>
                 <td><code>artist:morikura</code></td>
-                <td>ค้นหาชื่อนักวาดหรือโฟลเดอร์</td>
+                <td>ค้นหาตามชื่อนักวาดหรือรหัสโฟลเดอร์ Pixiv ID</td>
             </tr>
         </table>
 
@@ -325,7 +332,7 @@ class SearchHelpDialog(MinimizableDialog):
             <tr><th>คำสั่ง</th><th>ตัวอย่าง</th><th>คำอธิบาย</th></tr>
             <tr>
                 <td><code>type:ext</code></td>
-                <td><code>type:gif</code>, <code>type:png</code>, <code>type:video</code></td>
+                <td><code>type:mp4</code>, <code>type:gif</code>, <code>type:png</code>, <code>type:video</code></td>
                 <td>กรองเฉพาะไฟล์ภาพเคลื่อนไหว หรือวิดีโอ หรือภาพนิ่ง</td>
             </tr>
             <tr>
@@ -338,17 +345,17 @@ class SearchHelpDialog(MinimizableDialog):
         doc_view.setHtml(doc_html)
         layout.addWidget(doc_view)
 
-        # Clickable quick example chips
         layout.addWidget(QLabel("💡 Quick Try (คลิกตัวอย่างเพื่อใส่ลงช่องค้นหาทันที):"))
         chips_layout = QHBoxLayout()
         chips_layout.setSpacing(8)
 
         examples = [
+            ("⭐ Favorites", "is:fav", "chip"),
             ("🛡️ SFW Only", "rating:sfw", "chip-sfw"),
             ("🔞 NSFW Only", "rating:nsfw", "chip-nsfw"),
             ("👗 Swimsuit -Glasses", "swimsuit -glasses", "chip"),
             ("👤 Miku SFW", "char:hatsune_miku rating:sfw", "chip-sfw"),
-            ("🎬 GIF Only", "type:gif", "chip"),
+            ("🎬 MP4 Video", "type:mp4", "chip"),
             ("📦 Large (>5MB)", "size:>5mb", "chip"),
         ]
 
@@ -361,7 +368,6 @@ class SearchHelpDialog(MinimizableDialog):
 
         layout.addLayout(chips_layout)
 
-        # Footer Buttons
         footer = QHBoxLayout()
         footer.addStretch()
         btn_close = QPushButton("ปิดหน้าต่าง (Close)")
@@ -376,3 +382,397 @@ class SearchHelpDialog(MinimizableDialog):
         else:
             QApplication.clipboard().setText(query)
 
+
+class DatasetExporterDialog(MinimizableDialog):
+    """
+    One-Click Dataset Exporter for Kohya_ss / Stable Diffusion LoRA / Colab training.
+    Exports images alongside formatted `.txt` tag caption files.
+    """
+    def __init__(self, parent=None, file_paths=None, default_dir="", db_file=DB_FILE):
+        super().__init__(parent)
+        self.db_file = db_file or DB_FILE
+        self.initial_file_paths = list(file_paths or [])
+        self.output_dir = default_dir or ""
+        self.worker = None
+
+        self.setWindowTitle("📦 Dataset Exporter for LoRA / Colab (ส่งออกรูปภาพพร้อมไฟล์แท็ก .txt)")
+        self.resize(640, 480)
+        self.setStyleSheet("""
+            QDialog { background-color: #121216; color: #e5e7eb; }
+            QGroupBox {
+                border: 1px solid #2d2d38;
+                border-radius: 8px;
+                margin-top: 10px;
+                padding-top: 12px;
+                font-weight: bold;
+                color: #60a5fa;
+            }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }
+            QLineEdit {
+                background-color: #1e1e2a; color: #f3f4f6;
+                border: 1px solid #374151; border-radius: 6px; padding: 6px;
+            }
+            QPushButton {
+                background-color: #252538; color: #f3f4f6;
+                border: 1px solid #3b82f6; border-radius: 6px;
+                padding: 7px 14px; font-weight: bold;
+            }
+            QPushButton:hover { background-color: #3b82f6; color: white; }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        lbl_title = QLabel("📦 Export AI Dataset (รูปภาพ + ไฟล์ Caption .txt สำหรับเทรน LoRA / Colab)")
+        lbl_title.setStyleSheet("font-size: 15px; font-weight: bold; color: #38bdf8;")
+        layout.addWidget(lbl_title)
+
+        # Scope & Options Group
+        opt_group = QGroupBox("⚙️ ตั้งค่าการส่งออก (Export Options)")
+        opt_layout = QVBoxLayout(opt_group)
+
+        self.lbl_count = QLabel("")
+        self.lbl_count.setStyleSheet("color: #34d399; font-weight: bold;")
+        opt_layout.addWidget(self.lbl_count)
+
+        self.chk_sfw_only = QCheckBox("🛡️ คัดเฉพาะภาพปลอดภัย (SFW Only - ป้องกันภาพ 18+ หลุดเข้า Google Colab)")
+        self.chk_sfw_only.setChecked(True)
+        self.chk_sfw_only.toggled.connect(self._update_target_count)
+        opt_layout.addWidget(self.chk_sfw_only)
+
+        self.chk_spaces = QCheckBox("🔤 แปลง _ เป็นเว้นวรรค (เช่น hatsune_miku -> hatsune miku สำหรับ Kohya_ss)")
+        self.chk_spaces.setChecked(True)
+        opt_layout.addWidget(self.chk_spaces)
+
+        self.chk_copy_img = QCheckBox("🖼️ คัดลอกไฟล์รูปภาพไปยังโฟลเดอร์ปลายทางพร้อมไฟล์ .txt")
+        self.chk_copy_img.setChecked(True)
+        opt_layout.addWidget(self.chk_copy_img)
+
+        # Trigger word / prefix
+        prefix_row = QHBoxLayout()
+        prefix_row.addWidget(QLabel("Trigger Words (คั่นด้วย ,):"))
+        self.input_prefix = QLineEdit()
+        self.input_prefix.setPlaceholderText("เช่น masterpiece, best quality, 1girl (เว้นว่างได้)")
+        prefix_row.addWidget(self.input_prefix, 1)
+        opt_layout.addLayout(prefix_row)
+
+        # Confidence threshold
+        thresh_row = QHBoxLayout()
+        thresh_row.addWidget(QLabel("ความมั่นใจแท็กขั้นต่ำ (Min Confidence):"))
+        self.slider_conf = QSlider(Qt.Orientation.Horizontal)
+        self.slider_conf.setRange(20, 85)
+        self.slider_conf.setValue(35)
+        self.lbl_conf_val = QLabel("0.35")
+        self.lbl_conf_val.setStyleSheet("color: #38bdf8; font-weight: bold; min-width: 36px;")
+        self.slider_conf.valueChanged.connect(lambda v: self.lbl_conf_val.setText(f"{v/100:.2f}"))
+        thresh_row.addWidget(self.slider_conf, 1)
+        thresh_row.addWidget(self.lbl_conf_val)
+        opt_layout.addLayout(thresh_row)
+
+        # Output dir
+        dir_row = QHBoxLayout()
+        dir_row.addWidget(QLabel("โฟลเดอร์ปลายทาง:"))
+        self.input_dir = QLineEdit(self.output_dir)
+        dir_row.addWidget(self.input_dir, 1)
+        btn_browse = QPushButton("📂 เลือกโฟลเดอร์...")
+        btn_browse.clicked.connect(self.browse_dir)
+        dir_row.addWidget(btn_browse)
+        opt_layout.addLayout(dir_row)
+
+        layout.addWidget(opt_group)
+
+        # Progress
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        layout.addWidget(self.progress_bar)
+
+        self.lbl_status = QLabel("พร้อมส่งออก Dataset...")
+        self.lbl_status.setStyleSheet("color: #9ca3af;")
+        layout.addWidget(self.lbl_status)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        self.btn_export = QPushButton("🚀 เริ่มส่งออก Dataset (Start Export)")
+        self.btn_export.setStyleSheet("background-color: #059669; color: white; padding: 8px 18px;")
+        self.btn_export.clicked.connect(self.start_export)
+        btn_row.addWidget(self.btn_export)
+        btn_row.addStretch()
+        btn_close = QPushButton("ปิด (Close)")
+        btn_close.clicked.connect(self.close)
+        btn_row.addWidget(btn_close)
+        layout.addLayout(btn_row)
+
+        self._resolved_paths = []
+        self._update_target_count()
+
+    def _update_target_count(self):
+        sfw_only = self.chk_sfw_only.isChecked()
+        try:
+            conn = sqlite3.connect(self.db_file, timeout=10.0)
+            cursor = conn.cursor()
+            if self.initial_file_paths:
+                candidates = [p for p in self.initial_file_paths if os.path.exists(p)]
+            else:
+                cursor.execute("SELECT DISTINCT path FROM file_tags WHERE tag_name != '__none__' AND category != 99")
+                candidates = [r[0] for r in cursor.fetchall() if os.path.exists(r[0])]
+
+            if sfw_only and candidates:
+                from query_parser import resolve_matching_paths, parse_search_query
+                sfw_set = resolve_matching_paths(conn, parse_search_query("rating:sfw"))
+                if sfw_set is not None:
+                    candidates = [p for p in candidates if p in sfw_set]
+            conn.close()
+            self._resolved_paths = candidates
+        except Exception:
+            self._resolved_paths = list(self.initial_file_paths)
+
+        self.lbl_count.setText(f"📊 จำนวนไฟล์ที่จะส่งออก: {len(self._resolved_paths):,} ไฟล์")
+
+    def browse_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "เลือกโฟลเดอร์สำหรับบันทึก Dataset", self.input_dir.text())
+        if d:
+            self.input_dir.setText(d)
+
+    def start_export(self):
+        out_dir = self.input_dir.text().strip()
+        if not out_dir:
+            QMessageBox.warning(self, "แจ้งเตือน", "กรุณาเลือกโฟลเดอร์ปลายทางสำหรับส่งออก Dataset")
+            return
+        if not self._resolved_paths:
+            QMessageBox.warning(self, "แจ้งเตือน", "ไม่พบไฟล์ที่ตรงตามเงื่อนไขสำหรับส่งออก")
+            return
+
+        from workers import DatasetExportWorker
+        self.btn_export.setEnabled(False)
+        self.progress_bar.setValue(0)
+        self.lbl_status.setText("⏳ กำลังส่งออกไฟล์รูปภาพและ .txt captions...")
+
+        self.worker = DatasetExportWorker(
+            file_paths=self._resolved_paths,
+            output_dir=out_dir,
+            db_file=self.db_file,
+            min_confidence=self.slider_conf.value() / 100.0,
+            format_spaces=self.chk_spaces.isChecked(),
+            prefix_tags=self.input_prefix.text().strip(),
+            copy_images=self.chk_copy_img.isChecked()
+        )
+        self.worker.signals.progress.connect(self.on_progress)
+        self.worker.signals.finished.connect(self.on_finished)
+        QThreadPool.globalInstance().start(self.worker)
+
+    def on_progress(self, cur, tot, fname):
+        pct = int((cur / tot) * 100) if tot > 0 else 0
+        self.progress_bar.setValue(pct)
+        self.lbl_status.setText(f"กำลังส่งออก ({cur:,}/{tot:,}): {fname}")
+
+    def on_finished(self, count, out_dir):
+        self.btn_export.setEnabled(True)
+        self.progress_bar.setValue(100)
+        self.lbl_status.setText(f"✅ ส่งออกสำเร็จทั้งหมด {count:,} ไฟล์ ไปยัง {out_dir}")
+        QMessageBox.information(self, "ส่งออก Dataset สำเร็จ", f"ส่งออกรูปภาพพร้อมไฟล์แท็ก .txt จำนวน {count:,} ชุด เรียบร้อยแล้ว!")
+
+
+class DuplicateFinderDialog(MinimizableDialog):
+    """
+    Perceptual Hash (dHash) Duplicate & Similar Artwork Finder Dialog.
+    Detects identical and visually similar artworks across folders.
+    """
+    def __init__(self, parent=None, root_path=None, db_file=DB_FILE):
+        super().__init__(parent)
+        self.root_path = root_path
+        self.db_file = db_file or DB_FILE
+        self.worker = None
+        self.duplicate_groups = []
+
+        self.setWindowTitle("🔍 Duplicate & Similar Artwork Finder (ค้นหาภาพซ้ำด้วย Perceptual dHash)")
+        self.resize(820, 620)
+        self.setStyleSheet("""
+            QDialog { background-color: #121216; color: #e5e7eb; }
+            QListWidget {
+                background-color: #181822; color: #f3f4f6;
+                border: 1px solid #2d2d38; border-radius: 8px; padding: 6px;
+                font-size: 12px;
+            }
+            QListWidget::item { padding: 6px; border-bottom: 1px solid #222230; }
+            QListWidget::item:selected { background-color: #2563eb; color: white; }
+            QPushButton {
+                background-color: #252538; color: #f3f4f6;
+                border: 1px solid #3b82f6; border-radius: 6px;
+                padding: 6px 12px; font-weight: bold;
+            }
+            QPushButton:hover { background-color: #3b82f6; color: white; }
+            QComboBox {
+                background-color: #1e1e2a; color: white;
+                border: 1px solid #374151; border-radius: 6px; padding: 5px;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        lbl_title = QLabel("🔍 ค้นหาภาพซ้ำและภาพที่คล้ายกัน (64-bit Perceptual dHash)")
+        lbl_title.setStyleSheet("font-size: 15px; font-weight: bold; color: #60a5fa;")
+        layout.addWidget(lbl_title)
+
+        top_row = QHBoxLayout()
+        top_row.addWidget(QLabel("ความละเอียดการเทียบภาพ:"))
+        self.combo_dist = QComboBox()
+        self.combo_dist.addItem("🎯 เหมือนกันเป๊ะ 100% (Hamming Distance = 0)", 0)
+        self.combo_dist.addItem("🔍 ภาพเดียวกันแต่ต่างขนาด/การบีบอัด (Distance <= 2)", 2)
+        self.combo_dist.addItem("✨ ภาพคล้ายคลึง / Variations (Distance <= 4) [แนะนำ]", 4)
+        self.combo_dist.addItem("🌐 ค้นหากว้าง (Distance <= 6)", 6)
+        self.combo_dist.setCurrentIndex(1)
+        top_row.addWidget(self.combo_dist, 1)
+
+        self.btn_scan = QPushButton("🚀 เริ่มสแกนหาภาพซ้ำ (Start Scan)")
+        self.btn_scan.setStyleSheet("background-color: #059669; color: white;")
+        self.btn_scan.clicked.connect(self.start_scan)
+        top_row.addWidget(self.btn_scan)
+        layout.addLayout(top_row)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        layout.addWidget(self.progress_bar)
+
+        self.lbl_status = QLabel("กดปุ่ม 'เริ่มสแกนหาภาพซ้ำ' เพื่อคำนวณ dHash และเปรียบเทียบภาพในคลัง")
+        self.lbl_status.setStyleSheet("color: #9ca3af;")
+        layout.addWidget(self.lbl_status)
+
+        self.list_results = QListWidget()
+        self.list_results.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.list_results.itemDoubleClicked.connect(self.on_item_double_clicked)
+        layout.addWidget(self.list_results, 1)
+
+        footer = QHBoxLayout()
+        btn_preview = QPushButton("🖼️ เปิดดูใน Lightbox")
+        btn_preview.clicked.connect(self.open_selected_in_lightbox)
+        footer.addWidget(btn_preview)
+
+        btn_explorer = QPushButton("📂 แสดงใน Explorer")
+        btn_explorer.clicked.connect(self.open_selected_in_explorer)
+        footer.addWidget(btn_explorer)
+
+        btn_delete = QPushButton("🗑️ ลบไฟล์ที่เลือกออกจากดิสก์")
+        btn_delete.setStyleSheet("background-color: #7f1d1d; border-color: #ef4444; color: #fecaca;")
+        btn_delete.clicked.connect(self.delete_selected_files)
+        footer.addWidget(btn_delete)
+
+        footer.addStretch()
+        btn_close = QPushButton("ปิด (Close)")
+        btn_close.clicked.connect(self.close)
+        footer.addWidget(btn_close)
+        layout.addLayout(footer)
+
+    def start_scan(self):
+        from workers import DuplicateScannerWorker
+        self.btn_scan.setEnabled(False)
+        self.list_results.clear()
+        self.progress_bar.setValue(0)
+        self.lbl_status.setText("⏳ กำลังคำนวณ Perceptual dHash และค้นหาภาพซ้ำ...")
+
+        dist = self.combo_dist.currentData()
+        self.worker = DuplicateScannerWorker(
+            root_path=self.root_path,
+            db_file=self.db_file,
+            max_hamming_distance=dist if dist is not None else 2
+        )
+        self.worker.signals.progress.connect(self.on_progress)
+        self.worker.signals.finished.connect(self.on_finished)
+        QThreadPool.globalInstance().start(self.worker)
+
+    def on_progress(self, cur, tot, fname):
+        pct = int((cur / tot) * 100) if tot > 0 else 0
+        self.progress_bar.setValue(pct)
+        self.lbl_status.setText(f"กำลังตรวจสอบ ({cur:,}/{tot:,}): {fname}")
+
+    def on_finished(self, groups):
+        self.btn_scan.setEnabled(True)
+        self.progress_bar.setValue(100)
+        self.duplicate_groups = groups or []
+        self.list_results.clear()
+
+        if not self.duplicate_groups:
+            self.lbl_status.setText("✨ ไม่พบภาพซ้ำในคลังรูปภาพของคุณ")
+            return
+
+        total_dups = sum(len(g) for g in self.duplicate_groups)
+        self.lbl_status.setText(f"✅ พบกลุ่มภาพซ้ำ/คล้ายกันทั้งหมด {len(self.duplicate_groups):,} กลุ่ม (รวม {total_dups:,} ไฟล์) - ดับเบิลคลิกเพื่อดูภาพ")
+
+        for g_idx, group in enumerate(self.duplicate_groups, 1):
+            hdr = QListWidgetItem(f"━━━ 📁 กลุ่มที่ #{g_idx} ({len(group)} ไฟล์ที่คล้ายกัน) ━━━")
+            hdr.setFlags(Qt.ItemFlag.NoItemFlags)
+            hdr.setForeground(QColor("#60a5fa"))
+            self.list_results.addItem(hdr)
+
+            for rank, (path, size, mtime, dhash) in enumerate(group):
+                tag = "👑 [ไฟล์ใหญ่สุด/ต้นฉบับ]" if rank == 0 else "📄 [ไฟล์ซ้ำ/ขนาดเล็กกว่า]"
+                folder_name = os.path.basename(os.path.dirname(path))
+                item = QListWidgetItem(f"   {tag} {os.path.basename(path)}  ({format_size(size)})  — โฟลเดอร์: {folder_name}  [dHash: {dhash}]")
+                item.setData(Qt.ItemDataRole.UserRole, path)
+                self.list_results.addItem(item)
+
+    def on_item_double_clicked(self, item):
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if path and os.path.exists(path):
+            from lightbox_viewer import LightboxViewerDialog
+            dlg = LightboxViewerDialog([path], 0, self, db_file=self.db_file)
+            dlg.exec()
+
+    def open_selected_in_lightbox(self):
+        paths = [
+            it.data(Qt.ItemDataRole.UserRole)
+            for it in self.list_results.selectedItems()
+            if it.data(Qt.ItemDataRole.UserRole) and os.path.exists(it.data(Qt.ItemDataRole.UserRole))
+        ]
+        if paths:
+            from lightbox_viewer import LightboxViewerDialog
+            dlg = LightboxViewerDialog(paths, 0, self, db_file=self.db_file)
+            dlg.exec()
+
+    def open_selected_in_explorer(self):
+        for it in self.list_results.selectedItems():
+            p = it.data(Qt.ItemDataRole.UserRole)
+            if p and os.path.exists(p):
+                show_in_file_manager(p)
+                break
+
+    def delete_selected_files(self):
+        selected_items = [it for it in self.list_results.selectedItems() if it.data(Qt.ItemDataRole.UserRole)]
+        if not selected_items:
+            return
+        reply = QMessageBox.question(
+            self, "ยืนยันการลบไฟล์ซ้ำ",
+            f"คุณต้องการลบไฟล์ที่เลือกจำนวน {len(selected_items)} ไฟล์ ออกจากดิสก์ถาวรใช่หรือไม่?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        deleted = 0
+        conn = sqlite3.connect(self.db_file, timeout=15.0)
+        cursor = conn.cursor()
+        for it in selected_items:
+            p = it.data(Qt.ItemDataRole.UserRole)
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                    cursor.execute("DELETE FROM file_index WHERE path = ?", (p,))
+                    cursor.execute("DELETE FROM file_thumbnails WHERE path = ?", (p,))
+                    cursor.execute("DELETE FROM file_tags WHERE path = ?", (p,))
+                    row = self.list_results.row(it)
+                    self.list_results.takeItem(row)
+                    deleted += 1
+                except Exception:
+                    pass
+        conn.commit()
+        conn.close()
+        self.lbl_status.setText(f"🗑️ ลบไฟล์ซ้ำเรียบร้อยแล้ว {deleted} ไฟล์")
+
+    def closeEvent(self, event):
+        if self.worker:
+            self.worker.stop()
+        super().closeEvent(event)

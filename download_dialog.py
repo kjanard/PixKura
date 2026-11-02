@@ -9,6 +9,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QIcon
 from components import MinimizableDialog
+from config import load_app_config, update_app_config
 
 class PixivDownloadDialog(MinimizableDialog):
     def __init__(self, parent=None, default_dir=""):
@@ -47,7 +48,7 @@ class PixivDownloadDialog(MinimizableDialog):
 
         # PHPSESSID Cookie Input (for Bookmarks & R-18 works)
         cookie_layout = QHBoxLayout()
-        self.cookie_label = QLabel("PHPSESSID Cookie:")
+        self.cookie_label = QLabel("PHPSESSID Cookie (DPAPI Protected):")
         cookie_layout.addWidget(self.cookie_label)
         self.cookie_input = QLineEdit()
         self.cookie_input.setEchoMode(QLineEdit.EchoMode.Password)
@@ -140,24 +141,16 @@ class PixivDownloadDialog(MinimizableDialog):
 
     def load_saved_cookie(self):
         try:
-            if os.path.exists("config.json"):
-                with open("config.json", "r", encoding="utf-8") as f:
-                    cfg = json.load(f)
-                    saved_cookie = cfg.get("pixiv_cookie", "")
-                    if saved_cookie:
-                        self.cookie_input.setText(saved_cookie)
+            cfg = load_app_config()
+            saved_cookie = cfg.get("pixiv_cookie", "")
+            if saved_cookie:
+                self.cookie_input.setText(saved_cookie)
         except Exception as e:
             logging.error(f"Error loading saved cookie: {e}")
 
     def save_cookie_to_config(self, cookie):
         try:
-            cfg = {}
-            if os.path.exists("config.json"):
-                with open("config.json", "r", encoding="utf-8") as f:
-                    cfg = json.load(f)
-            cfg["pixiv_cookie"] = cookie if cookie else ""
-            with open("config.json", "w", encoding="utf-8") as f:
-                json.dump(cfg, f, indent=4)
+            update_app_config({"pixiv_cookie": cookie if cookie else ""})
         except Exception as e:
             logging.error(f"Error saving cookie: {e}")
 

@@ -1,10 +1,13 @@
 import os
+import shutil
+import tempfile
 import sqlite3
 import logging
 import time
 import random
 import io
 import queue
+import zipfile
 import requests
 import concurrent.futures
 import numpy as np
@@ -23,20 +26,53 @@ from pixivpy3 import AppPixivAPI
 
 from config import (
     DB_FILE, ALL_MEDIA_EXT, EXT_IMG, EXT_GIF, EXT_VID, EXT_ZIP,
-    DEFAULT_CHARACTER_THRESHOLD, DEFAULT_GENERAL_THRESHOLD
+    DEFAULT_CHARACTER_THRESHOLD, DEFAULT_GENERAL_THRESHOLD,
+    MAX_UGOIRA_FRAME_BYTES, MAX_UGOIRA_TOTAL_BYTES, MAX_UGOIRA_FRAMES,
+    load_app_config
 )
-from utils import load_media_thumbnail, make_thumbnail_rgb, overlay_avatar_on_grid, detect_drive_media_type
+from utils import (
+    load_media_thumbnail, make_thumbnail_rgb, overlay_avatar_on_grid,
+    detect_drive_media_type, compute_dhash, hamming_distance_hex
+)
 from danbooru_api import DanbooruClient
 
 import threading
 _thread_local = threading.local()
+_conn_lock = threading.Lock()
+_all_thread_conns = set()
+
+
+def _safe_emit(signal, *args):
+    """Safely emits a Qt signal, ignoring RuntimeError if the underlying QObject was deleted."""
+    try:
+        signal.emit(*args)
+    except RuntimeError:
+        pass
+
 
 def get_thread_local_conn(db_file, timeout=30.0):
-    if not hasattr(_thread_local, "conn") or _thread_local.conn is None or getattr(_thread_local, "db_file", None) != db_file:
+    need_new = (
+        not hasattr(_thread_local, "conn")
+        or _thread_local.conn is None
+        or getattr(_thread_local, "db_file", None) != db_file
+    )
+    if not need_new:
+        try:
+            _thread_local.conn.rollback()
+        except sqlite3.ProgrammingError:
+            need_new = True
+        except Exception:
+            pass
+
+    if need_new:
         if hasattr(_thread_local, "conn") and _thread_local.conn is not None:
-            try: _thread_local.conn.close()
-            except: pass
-        conn = sqlite3.connect(db_file, timeout=timeout)
+            try:
+                with _conn_lock:
+                    _all_thread_conns.discard(_thread_local.conn)
+                _thread_local.conn.close()
+            except Exception:
+                pass
+        conn = sqlite3.connect(db_file, timeout=timeout, check_same_thread=False)
         try:
             conn.execute('PRAGMA journal_mode = WAL;')
             conn.execute('PRAGMA synchronous = NORMAL;')
@@ -47,10 +83,176 @@ def get_thread_local_conn(db_file, timeout=30.0):
             pass
         _thread_local.conn = conn
         _thread_local.db_file = db_file
-    else:
-        try: _thread_local.conn.rollback()
-        except: pass
+        with _conn_lock:
+            _all_thread_conns.add(conn)
     return _thread_local.conn
+
+
+def close_all_thread_local_conns():
+    """Closes all tracked thread-local SQLite connections so WAL checkpoint / VACUUM can obtain an exclusive lock."""
+    with _conn_lock:
+        conns = list(_all_thread_conns)
+        _all_thread_conns.clear()
+    for c in conns:
+        try:
+            c.close()
+        except Exception:
+            pass
+    try:
+        if hasattr(_thread_local, "conn"):
+            _thread_local.conn = None
+    except Exception:
+        pass
+
+
+def convert_frames_to_mp4(pil_frames, durations, mp4_filepath):
+    """
+    Converts a list of PIL Images and frame durations (in ms) into an MP4 video using OpenCV.
+    Handles odd dimensions by padding/resizing to even numbers and preserves variable frame timing.
+    Writes to an ASCII temp file first to support Unicode paths on Windows.
+    """
+    if not _CV2_AVAILABLE or _cv2 is None or not pil_frames:
+        return False
+
+    try:
+        w, h = pil_frames[0].size
+        if w <= 0 or h <= 0:
+            return False
+        w_even = w + (w % 2)
+        h_even = h + (h % 2)
+
+        clean_delays = [max(10, int(d) if d else 100) for d in (durations or [100] * len(pil_frames))]
+        if len(clean_delays) < len(pil_frames):
+            clean_delays.extend([100] * (len(pil_frames) - len(clean_delays)))
+
+        min_delay = min(clean_delays) if clean_delays else 100
+        max_delay = max(clean_delays) if clean_delays else 100
+
+        if max_delay - min_delay <= 5:
+            avg_delay = sum(clean_delays) / len(clean_delays)
+            fps = min(60.0, max(1.0, 1000.0 / avg_delay))
+            frame_repeats = [1] * len(pil_frames)
+        else:
+            fps = min(60.0, max(10.0, round(1000.0 / min_delay)))
+            frame_interval_ms = 1000.0 / fps
+            frame_repeats = []
+            acc_ms = 0.0
+            for d in clean_delays[:len(pil_frames)]:
+                acc_ms += d
+                rep = max(1, int(round(acc_ms / frame_interval_ms)))
+                acc_ms -= rep * frame_interval_ms
+                frame_repeats.append(min(rep, 300))
+
+        os.makedirs(os.path.dirname(os.path.abspath(mp4_filepath)), exist_ok=True)
+        fd, tmp_mp4 = tempfile.mkstemp(suffix=".mp4")
+        os.close(fd)
+
+        writer = None
+        for fourcc_str in ('mp4v', 'avc1'):
+            try:
+                fourcc = _cv2.VideoWriter_fourcc(*fourcc_str)
+                vw = _cv2.VideoWriter(tmp_mp4, fourcc, float(fps), (w_even, h_even))
+                if vw is not None and vw.isOpened():
+                    writer = vw
+                    break
+            except Exception:
+                continue
+
+        if writer is None:
+            if os.path.exists(tmp_mp4):
+                try:
+                    os.remove(tmp_mp4)
+                except OSError:
+                    pass
+            return False
+
+        try:
+            for img, rep in zip(pil_frames, frame_repeats):
+                if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in getattr(img, 'info', {})):
+                    canvas = Image.new('RGB', img.size, (255, 255, 255))
+                    rgba = img.convert('RGBA')
+                    canvas.paste(rgba, mask=rgba.split()[3])
+                    img_rgb = canvas
+                else:
+                    img_rgb = img.convert('RGB')
+
+                if img_rgb.size != (w_even, h_even):
+                    img_rgb = img_rgb.resize((w_even, h_even), Image.Resampling.BILINEAR)
+
+                bgr = np.asarray(img_rgb, dtype=np.uint8)[:, :, ::-1].copy()
+                for _ in range(rep):
+                    writer.write(bgr)
+        finally:
+            writer.release()
+
+        if os.path.exists(tmp_mp4) and os.path.getsize(tmp_mp4) > 0:
+            if os.path.exists(mp4_filepath):
+                try:
+                    os.remove(mp4_filepath)
+                except OSError:
+                    pass
+            shutil.move(tmp_mp4, mp4_filepath)
+            return True
+        else:
+            if os.path.exists(tmp_mp4):
+                try:
+                    os.remove(tmp_mp4)
+                except OSError:
+                    pass
+            return False
+    except Exception as e:
+        logging.error(f"Error converting Ugoira frames to MP4: {e}")
+        return False
+
+
+def decode_image_cv2_for_wd14(path, target_size=448, target_dtype=np.float32, nchw=False):
+    """
+    Fast C++ OpenCV image decoder & preprocessor for WD14 Tagger.
+    Properly handles 4-channel RGBA/BGRA transparency (compositing onto a white background)
+    and 2D grayscale images, matching WD14Tagger.preprocess_image.
+    """
+    if not _CV2_AVAILABLE or _cv2 is None:
+        return None
+    raw = np.fromfile(path, dtype=np.uint8)
+    img = _cv2.imdecode(raw, _cv2.IMREAD_UNCHANGED)
+    if img is None:
+        return None
+
+    if img.ndim == 2:
+        img = _cv2.cvtColor(img, _cv2.COLOR_GRAY2BGR)
+    elif img.ndim == 3 and img.shape[2] == 4:
+        if img.dtype == np.uint16:
+            img = (img / 256).astype(np.uint8)
+        b_ch, g_ch, r_ch, a_ch = _cv2.split(img)
+        alpha = a_ch.astype(np.float32) / 255.0
+        inv_alpha = 1.0 - alpha
+        b = (b_ch.astype(np.float32) * alpha + 255.0 * inv_alpha).astype(np.uint8)
+        g = (g_ch.astype(np.float32) * alpha + 255.0 * inv_alpha).astype(np.uint8)
+        r = (r_ch.astype(np.float32) * alpha + 255.0 * inv_alpha).astype(np.uint8)
+        img = _cv2.merge((b, g, r))
+    elif img.ndim == 3 and img.shape[2] > 3:
+        img = img[:, :, :3]
+
+    if img.dtype == np.uint16:
+        img = (img / 256).astype(np.uint8)
+
+    h, w = img.shape[:2]
+    if h <= 0 or w <= 0:
+        return None
+
+    scale = target_size / max(h, w)
+    nw = max(1, int(w * scale))
+    nh = max(1, int(h * scale))
+    resized = _cv2.resize(img, (nw, nh), interpolation=_cv2.INTER_LINEAR)
+    padded = np.full((target_size, target_size, 3), 255, dtype=target_dtype)
+    px = (target_size - nw) // 2
+    py = (target_size - nh) // 2
+    padded[py:py+nh, px:px+nw] = resized.astype(target_dtype)
+
+    if nchw:
+        padded = np.transpose(padded, (2, 0, 1))
+    return np.expand_dims(padded, axis=0)
+
 
 class WorkerSignals(QObject):
     result = pyqtSignal(int, object) 
@@ -72,7 +274,7 @@ class FolderCacheScanner(QRunnable):
     @pyqtSlot()
     def run(self):
         # 1. แจ้งเตือนตอนเริ่มอ่านฐานข้อมูล
-        self.signals.api_log.emit("🔍 กำลังตรวจสอบข้อมูลโฟลเดอร์จาก Database...")
+        _safe_emit(self.signals.api_log, "🔍 กำลังตรวจสอบข้อมูลโฟลเดอร์จาก Database...")
         
         conn = get_thread_local_conn(self.db_file)
         try:
@@ -114,17 +316,17 @@ class FolderCacheScanner(QRunnable):
                     # ส่ง raw blob (JPEG ~10KB) แทน QImage (225KB) เพื่อประหยัด RAM
                     batch.append((aid, display_name, grid_blob, profile_blob, mtime or 0.0, fcount or 0, ctime or 0.0))
                     if len(batch) >= batch_size: 
-                        self.signals.scan_batch.emit(self.gen_id, batch) 
+                        _safe_emit(self.signals.scan_batch, self.gen_id, batch)
                         batch = []
 
                 if batch: 
-                    self.signals.scan_batch.emit(self.gen_id, batch)
+                    _safe_emit(self.signals.scan_batch, self.gen_id, batch)
                     batch = []
 
             if not self.running: return
 
             # Phase 2: ตรวจสอบโฟลเดอร์จริงบนฮาร์ดดิสก์ และตรวจนับไฟล์ภายในทุกโฟลเดอร์ (ไส้ใน)
-            self.signals.api_log.emit("📂 กำลังตรวจสอบการเปลี่ยนแปลงและนับไฟล์ในทุกโฟลเดอร์...")
+            _safe_emit(self.signals.api_log, "📂 กำลังตรวจสอบการเปลี่ยนแปลงและนับไฟล์ในทุกโฟลเดอร์...")
 
             try:
                 real_folders = [f.name for f in os.scandir(self.root) if f.is_dir() and not f.name.startswith('.')]
@@ -134,7 +336,7 @@ class FolderCacheScanner(QRunnable):
 
             real_folders_set = set(real_folders)
 
-            # จัดการลบโฟลเดอร์ที่ถูกลบออกจากตาราง thumbnails และ file_index ทันที
+            # จัดการลบโฟลเดอร์ที่ถูกลบออกจากตาราง thumbnails, file_index, file_thumbnails และ file_tags ทันที
             deleted_aids = [aid for aid in db_folders_info.keys() if aid not in real_folders_set]
             if deleted_aids:
                 try:
@@ -143,6 +345,11 @@ class FolderCacheScanner(QRunnable):
                         cursor.executemany("DELETE FROM thumbnails WHERE artist_id = ?", chunk)
                         parent_patterns = [(os.path.join(self.root, a[0]) + '%',) for a in chunk]
                         cursor.executemany("DELETE FROM file_index WHERE parent_folder LIKE ?", parent_patterns)
+                        for a in chunk:
+                            prefix = os.path.join(self.root, a[0]) + os.sep
+                            prefix_upper = prefix + "\uffff"
+                            cursor.execute("DELETE FROM file_thumbnails WHERE path >= ? AND path < ?", (prefix, prefix_upper))
+                            cursor.execute("DELETE FROM file_tags WHERE path >= ? AND path < ?", (prefix, prefix_upper))
                     conn.commit()
                 except Exception as e: logging.error(f"Error deleting missing folders: {e}")
 
@@ -193,7 +400,7 @@ class FolderCacheScanner(QRunnable):
                             pass
 
                     if len(new_folders_batch) >= batch_size:
-                        self.signals.scan_batch.emit(self.gen_id, new_folders_batch)
+                        _safe_emit(self.signals.scan_batch, self.gen_id, new_folders_batch)
                         new_folders_batch = []
 
                 # กรณี B: เป็นโฟลเดอร์เดิม ตรวจสอบว่าไฟล์ภายใน (ไส้ใน) มีการเปลี่ยนแปลงหรือไม่
@@ -227,7 +434,7 @@ class FolderCacheScanner(QRunnable):
                             logging.error(f"Error updating file_index for {dir_path}: {e}")
 
                         # ส่งสัญญาณแจ้ง UI ให้อัปเดตจำนวนไฟล์และคิวเจนปกทันที
-                        self.signals.folder_updated.emit(self.gen_id, folder_name, dname, None, actual_fcount, actual_mtime, actual_ctime)
+                        _safe_emit(self.signals.folder_updated, self.gen_id, folder_name, dname, None, actual_fcount, actual_mtime, actual_ctime)
 
                 # Batch save to DB
                 if len(thumbnails_updates) >= 500:
@@ -241,7 +448,7 @@ class FolderCacheScanner(QRunnable):
                     file_index_inserts = []
 
             if new_folders_batch:
-                self.signals.scan_batch.emit(self.gen_id, new_folders_batch)
+                _safe_emit(self.signals.scan_batch, self.gen_id, new_folders_batch)
 
             if thumbnails_updates:
                 cursor.executemany("INSERT OR REPLACE INTO thumbnails (artist_id, image_data, folder_mtime, file_count, folder_ctime) VALUES (?, ?, ?, ?, ?)", thumbnails_updates)
@@ -250,14 +457,14 @@ class FolderCacheScanner(QRunnable):
             conn.commit()
 
             total_folders = len(real_folders)
-            self.signals.scan_finished.emit(self.gen_id, total_folders)
+            _safe_emit(self.signals.scan_finished, self.gen_id, total_folders)
             log_msg = f"✅ ตรวจสอบเสร็จสิ้น: {total_folders} โฟลเดอร์ (พบใหม่ {new_count}, มีไฟล์เพิ่ม/ลด {modified_folders}, ลบออก {len(deleted_aids)})"
-            self.signals.api_log.emit(log_msg)
+            _safe_emit(self.signals.api_log, log_msg)
 
         except Exception as e:
             logging.error(f"Error in FolderCacheScanner: {e}")
         finally:
-            pass # conn.close()
+            pass
         
     def stop(self): self.running = False
 
@@ -368,9 +575,9 @@ class ThumbnailGeneratorWorker(QRunnable):
                         except Exception as e: logging.error(f"Error: {e}")
 
             finally:
-                pass # conn.close()
+                pass
             # Emit blob (ไม่ใช่ QImage) — UI จะ decode เฉพาะตอนแสดงผลจริง
-            self.signals.folder_updated.emit(self.gen_id, self.artist_id, name, blob, file_count, current_mtime, current_ctime)
+            _safe_emit(self.signals.folder_updated, self.gen_id, self.artist_id, name, blob, file_count, current_mtime, current_ctime)
         except Exception as e: logging.error(f"Error: {e}")
 
     def composite(self, path, files):
@@ -411,11 +618,8 @@ class ImageLoaderWorker(QRunnable):
             if row:
                 blob = row[0]
                 qimg = QImage.fromData(blob)
-            pass # conn.close()
         except Exception as e:
-            import traceback
-            print(f"[workers.py] SQLite Read Error for {self.path}: {e}")
-            traceback.print_exc()
+            logging.debug(f"[workers.py] SQLite Read Error for {self.path}: {e}")
 
         # 2. If not found in cache, generate it from disk (images only)
         if qimg is None or qimg.isNull():
@@ -440,19 +644,14 @@ class ImageLoaderWorker(QRunnable):
                         cursor = conn.cursor()
                         cursor.execute("INSERT OR REPLACE INTO file_thumbnails (path, image_data) VALUES (?, ?)", (self.path, blob))
                         conn.commit()
-                        pass # conn.close()
                     except Exception as e:
-                        import traceback
-                        print(f"[workers.py] SQLite Write Error for {self.path}: {e}")
-                        traceback.print_exc()
+                        logging.debug(f"[workers.py] SQLite Write Error for {self.path}: {e}")
                 except Exception as e:
-                    import traceback
-                    print(f"[workers.py] Thumbnail Generation Error for {self.path}: {e}")
-                    traceback.print_exc()
+                    logging.debug(f"[workers.py] Thumbnail Generation Error for {self.path}: {e}")
 
         # 3. Emit the loaded thumbnail
         if qimg and not qimg.isNull():
-            self.signals.image_loaded.emit(self.gen_id, self.path, qimg, ftype)
+            _safe_emit(self.signals.image_loaded, self.gen_id, self.path, qimg, ftype)
 
 class StreamScanner(QRunnable):
     def __init__(self, root, db_file, gen_id, use_cache=True, filter_mode='ALL',
@@ -468,6 +667,7 @@ class StreamScanner(QRunnable):
         self.rating_filter = rating_filter or 'ALL'
         self.matched_tag_paths = None
         self.kw_tag_paths = {}
+        self.artist_name_map = {}
         self.signals = WorkerSignals(); self.running = True
 
         if self.parsed_query:
@@ -488,7 +688,20 @@ class StreamScanner(QRunnable):
             if clean_ext not in self.parsed_query.file_types:
                 return False
 
-        # Check tag/rating filter (SFW/NSFW, characters, series, tags)
+        # Check artist filter from parsed_query (e.g. artist:12345 or artist:ask)
+        if self.parsed_query and (self.parsed_query.include_artists or self.parsed_query.exclude_artists) and filepath:
+            parent_folder_name = os.path.basename(os.path.dirname(filepath)).lower()
+            artist_name = self.artist_name_map.get(parent_folder_name, "")
+            for inc_art in self.parsed_query.include_artists:
+                art_l = inc_art.lower()
+                if not (art_l == parent_folder_name or art_l in parent_folder_name or (artist_name and art_l in artist_name)):
+                    return False
+            for exc_art in self.parsed_query.exclude_artists:
+                art_l = exc_art.lower()
+                if art_l == parent_folder_name or art_l in parent_folder_name or (artist_name and art_l in artist_name):
+                    return False
+
+        # Check tag/rating/favorite filter (SFW/NSFW, characters, series, tags, is:fav)
         if self.matched_tag_paths is not None and filepath and filepath not in self.matched_tag_paths:
             return False
 
@@ -496,11 +709,13 @@ class StreamScanner(QRunnable):
         if self.search_keyword and self.search_keyword not in filename.lower():
             return False
 
-        # Check parsed_query keywords (match filename OR tag)
+        # Check parsed_query keywords (match filename OR tag OR artist name)
         if self.parsed_query and self.parsed_query.keywords:
             fn_lower = filename.lower()
+            parent_folder_name = os.path.basename(os.path.dirname(filepath)).lower() if filepath else ""
+            artist_name = self.artist_name_map.get(parent_folder_name, "") if parent_folder_name else ""
             for kw in self.parsed_query.keywords:
-                matched_in_fn = kw in fn_lower
+                matched_in_fn = kw in fn_lower or (artist_name and kw in artist_name)
                 matched_in_tags = (filepath is not None and filepath in self.kw_tag_paths.get(kw, set()))
                 if not matched_in_fn and not matched_in_tags:
                     return False
@@ -530,10 +745,19 @@ class StreamScanner(QRunnable):
 
     @pyqtSlot()
     def run(self):
-        self.signals.api_log.emit("กำลังสแกนหาไฟล์รูปภาพ/วิดีโอทั้งหมด...")
+        _safe_emit(self.signals.api_log, "กำลังสแกนหาไฟล์รูปภาพ/วิดีโอทั้งหมด...")
         conn = get_thread_local_conn(self.db_file); cursor = conn.cursor()
 
-        # Resolve tag / character / rating queries via query_parser
+        # Load artist names for artist: filter and keyword search
+        try:
+            cursor.execute("SELECT artist_id, name FROM artists WHERE name IS NOT NULL")
+            for aid, name in cursor.fetchall():
+                if aid and name:
+                    self.artist_name_map[str(aid).lower()] = str(name).lower()
+        except Exception:
+            pass
+
+        # Resolve tag / character / rating / favorite queries via query_parser
         has_query = (
             self.parsed_query is not None or 
             (self.rating_filter and self.rating_filter != 'ALL') or 
@@ -541,12 +765,19 @@ class StreamScanner(QRunnable):
         )
         if has_query:
             try:
+                import copy
                 from query_parser import resolve_matching_paths, parse_search_query, SearchQuery
                 q = self.parsed_query or SearchQuery()
                 if isinstance(q, str):
                     q = parse_search_query(q)
+                    self.parsed_query = q
 
-                resolved = resolve_matching_paths(conn, q, active_rating=self.rating_filter, active_char=self.tag_filter)
+                # Artist filtering is handled directly in check_filter so unindexed disk files also match
+                q_for_tags = copy.copy(q)
+                q_for_tags.include_artists = []
+                q_for_tags.exclude_artists = []
+
+                resolved = resolve_matching_paths(conn, q_for_tags, active_rating=self.rating_filter, active_char=self.tag_filter)
                 if resolved is not None:
                     self.matched_tag_paths = resolved
 
@@ -601,10 +832,10 @@ class StreamScanner(QRunnable):
                 if self.check_filter(os.path.basename(path), filepath=path, fsize=size, fmtime=mtime):
                     db_list.append((path, size, mtime, ctime))
                     if len(db_list) >= batch_size:
-                        self.signals.scan_batch.emit(self.gen_id, db_list)
+                        _safe_emit(self.signals.scan_batch, self.gen_id, db_list)
                         db_list = []
             if db_list:
-                self.signals.scan_batch.emit(self.gen_id, db_list)
+                _safe_emit(self.signals.scan_batch, self.gen_id, db_list)
 
         # 2. Walk directory to find additions and modifications
         for r, d, f in os.walk(self.root):
@@ -640,7 +871,7 @@ class StreamScanner(QRunnable):
                                 ui_batch.append((full_path, fsize, fmtime, fctime))
 
                     if len(ui_batch) >= batch_size:
-                        self.signals.scan_batch.emit(self.gen_id, ui_batch)
+                        _safe_emit(self.signals.scan_batch, self.gen_id, ui_batch)
                         ui_batch = []
 
                     if len(new_or_updated) >= batch_size:
@@ -648,29 +879,46 @@ class StreamScanner(QRunnable):
                         new_or_updated = []
 
         if ui_batch:
-            self.signals.scan_batch.emit(self.gen_id, ui_batch)
+            _safe_emit(self.signals.scan_batch, self.gen_id, ui_batch)
         if new_or_updated:
             self.save_batch_to_db(cursor, new_or_updated)
 
-        # 3. Clean up deleted files from SQLite index
+        # 3. Clean up deleted files from SQLite index (only when not filtering by subset)
         deleted_paths = []
+        is_unfiltered_scan = (
+            self.filter_mode == 'ALL'
+            and self.matched_tag_paths is None
+            and not self.search_keyword
+            and self.min_size is None
+            and self.max_size is None
+            and self.min_mtime is None
+            and (not self.parsed_query or (
+                not self.parsed_query.file_types
+                and not self.parsed_query.keywords
+                and not self.parsed_query.include_artists
+                and not self.parsed_query.exclude_artists
+            ))
+        )
         for path in db_files.keys():
             if path not in seen_on_disk:
-                deleted_paths.append((path,))
+                if is_unfiltered_scan or not os.path.exists(path):
+                    deleted_paths.append((path,))
 
         if deleted_paths:
             try:
                 for i in range(0, len(deleted_paths), 500):
                     batch_del = deleted_paths[i:i+500]
                     cursor.executemany("DELETE FROM file_index WHERE path = ?", batch_del)
+                    cursor.executemany("DELETE FROM file_thumbnails WHERE path = ?", batch_del)
+                    cursor.executemany("DELETE FROM file_tags WHERE path = ?", batch_del)
                 conn.commit()
             except Exception as e:
                 pass
 
-        conn.commit(); pass # conn.close()
+        conn.commit()
         total_count = len(seen_on_disk)
-        self.signals.scan_finished.emit(self.gen_id, total_count)
-        self.signals.api_log.emit(f"สแกนเสร็จสิ้น พบไฟล์ทั้งหมด {total_count} ไฟล์ (ลบไฟล์ที่หายไป {len(deleted_paths)} ไฟล์)")
+        _safe_emit(self.signals.scan_finished, self.gen_id, total_count)
+        _safe_emit(self.signals.api_log, f"สแกนเสร็จสิ้น พบไฟล์ทั้งหมด {total_count} ไฟล์ (ลบไฟล์ที่หายไป {len(deleted_paths)} ไฟล์)")
 
     def save_batch_to_db(self, cursor, data_tuples):
         try:
@@ -703,7 +951,7 @@ class ApiFetcherWorker(QRunnable):
             api = AppPixivAPI()
             api.auth(refresh_token=self.token)
         except Exception as e: 
-            self.signals.api_log.emit(str(e))
+            _safe_emit(self.signals.api_log, str(e))
             return
 
         for i, aid in enumerate(self.ids):
@@ -730,17 +978,16 @@ class ApiFetcherWorker(QRunnable):
                             if cursor_write.rowcount == 0:
                                 cursor_write.execute('INSERT INTO artists (artist_id, name) VALUES(?,?)', (aid, name))
                         conn_write.commit()
-                        pass # conn_write.close()
                     except Exception as e: logging.error(f"Error: {e}")
 
-                    self.signals.api_updated.emit(aid, name, blob)
-                    self.signals.api_log.emit(f"Updated {aid}: {name}")
+                    _safe_emit(self.signals.api_updated, aid, name, blob)
+                    _safe_emit(self.signals.api_log, f"Updated {aid}: {name}")
                 time.sleep(1.5) # ลดความถี่ลงเพื่อหลีกเลี่ยง rate limit
             except Exception as e:
-                self.signals.api_log.emit(f"Error {aid}: {e}")
+                _safe_emit(self.signals.api_log, f"Error {aid}: {e}")
                 time.sleep(2)
 
-        self.signals.api_log.emit("Done")
+        _safe_emit(self.signals.api_log, "Done")
 
     def stop(self): self.running = False
 
@@ -838,15 +1085,15 @@ class BooruNameUpdateWorker(QRunnable):
                     except Exception as e:
                         logging.error(f"Error saving artist {aid}: {e}")
 
-                    self.signals.api_updated.emit(aid, found_name, avatar_blob)
+                    _safe_emit(self.signals.api_updated, aid, found_name, avatar_blob)
                     if status == "deleted":
-                        self.signals.api_log.emit(f"ID {aid}: บัญชีถูกลบ/ปิดไปแล้วจาก Pixiv -> บันทึกเป็น [Deleted User]")
+                        _safe_emit(self.signals.api_log, f"ID {aid}: บัญชีถูกลบ/ปิดไปแล้วจาก Pixiv -> บันทึกเป็น [Deleted User]")
                     else:
-                        self.signals.api_log.emit(f"Found: {found_name}")
+                        _safe_emit(self.signals.api_log, f"Found: {found_name}")
                 else:
-                    self.signals.api_log.emit(f"ID {aid} not found in Pixiv/Danbooru/Safebooru")
+                    _safe_emit(self.signals.api_log, f"ID {aid} not found in Pixiv/Danbooru/Safebooru")
 
-        self.signals.api_log.emit("Name Update Finished")
+        _safe_emit(self.signals.api_log, "Name Update Finished")
 
     def stop(self):
         self.running = False
@@ -925,10 +1172,10 @@ class BackgroundThumbnailPreloader(QRunnable):
                             if len(uncommitted) >= 50:
                                 conn.commit()
                                 uncommitted = []
-                    except Exception as e:
+                    except Exception:
                         pass
             finally:
-                    executor.shutdown(wait=False, cancel_futures=True)
+                executor.shutdown(wait=False, cancel_futures=True)
 
         finally:
             if uncommitted:
@@ -936,10 +1183,6 @@ class BackgroundThumbnailPreloader(QRunnable):
                     conn.commit()
                 except Exception:
                     pass
-            try:
-                pass # conn.close()
-            except Exception as e:
-                logging.error(f"Error: {e}")
 
     def stop(self):
         self.running = False
@@ -994,7 +1237,7 @@ class PixivDownloaderWorker(QRunnable):
                         f.write(chunk)
                 return True
         except Exception as e:
-            self.signals.log.emit(f"❌ Error downloading {os.path.basename(filepath)}: {e}")
+            _safe_emit(self.signals.log, f"❌ Error downloading {os.path.basename(filepath)}: {e}")
             if os.path.exists(filepath):
                 try: os.remove(filepath)
                 except Exception: pass
@@ -1027,12 +1270,12 @@ class PixivDownloaderWorker(QRunnable):
             cursor.execute('INSERT OR REPLACE INTO file_index (path, filename, parent_folder, mtime, size, ctime) VALUES (?, ?, ?, ?, ?, ?)',
                            (filepath, filename, parent_folder, mtime, size, ctime))
             conn.commit()
-            pass # conn.close()
-        except:
+        except Exception:
             pass
 
     def process_ugoira(self, ill_id, headers, dest_dir, filename_prefix, artist_id=None, artist_name=None):
         meta_url = f"https://www.pixiv.net/ajax/illust/{ill_id}/ugoira_meta"
+        temp_zip = None
         try:
             req_headers = headers.copy()
             req_headers['Referer'] = f"https://www.pixiv.net/artworks/{ill_id}"
@@ -1040,43 +1283,59 @@ class PixivDownloaderWorker(QRunnable):
             if r.status_code != 200:
                 if r.status_code == 404:
                     if not self.cookie:
-                        self.signals.log.emit(f"   ❌ Failed to fetch Ugoira metadata (HTTP 404): This artwork is likely R-18 / restricted. Pixiv requires a valid PHPSESSID cookie to download R-18 works.")
+                        _safe_emit(self.signals.log, "   ❌ Failed to fetch Ugoira metadata (HTTP 404): This artwork is likely R-18 / restricted. Pixiv requires a valid PHPSESSID cookie to download R-18 works.")
                     else:
-                        self.signals.log.emit(f"   ❌ Failed to fetch Ugoira metadata (HTTP 404): Artwork not found or inaccessible. If this is an R-18 work, please verify your PHPSESSID is valid and R-18 display is enabled in Pixiv Settings.")
+                        _safe_emit(self.signals.log, "   ❌ Failed to fetch Ugoira metadata (HTTP 404): Artwork not found or inaccessible. If this is an R-18 work, please verify your PHPSESSID is valid and R-18 display is enabled in Pixiv Settings.")
                 else:
-                    self.signals.log.emit(f"   ❌ Failed to fetch Ugoira metadata (HTTP {r.status_code})")
+                    _safe_emit(self.signals.log, f"   ❌ Failed to fetch Ugoira metadata (HTTP {r.status_code})")
                 return False
             data = r.json()
             if data.get('error'):
-                self.signals.log.emit(f"   ❌ Ugoira API error: {data.get('message')}")
+                _safe_emit(self.signals.log, f"   ❌ Ugoira API error: {data.get('message')}")
                 return False
         
             body = data.get('body', {})
             zip_url = body.get('src')
             frames = body.get('frames', [])
             if not zip_url or not frames:
-                self.signals.log.emit("   ❌ Ugoira metadata is incomplete (missing zip src or frames)")
+                _safe_emit(self.signals.log, "   ❌ Ugoira metadata is incomplete (missing zip src or frames)")
                 return False
+
+            if len(frames) > MAX_UGOIRA_FRAMES:
+                _safe_emit(self.signals.log, f"   ⚠️ Ugoira has too many frames ({len(frames)}), truncating to {MAX_UGOIRA_FRAMES}.")
+                frames = frames[:MAX_UGOIRA_FRAMES]
+
+            mp4_filename = f"{filename_prefix}.mp4"
+            mp4_filepath = os.path.join(dest_dir, mp4_filename)
+            gif_filepath = os.path.join(dest_dir, f"{filename_prefix}.gif")
         
-            gif_filename = f"{filename_prefix}.gif"
-            gif_filepath = os.path.join(dest_dir, gif_filename)
-        
-            import zipfile
             temp_zip = os.path.join(dest_dir, f"temp_{ill_id}.zip")
-            self.signals.log.emit(f"   📥 Downloading Ugoira zip file...")
+            _safe_emit(self.signals.log, "   📥 Downloading Ugoira zip file...")
             if not self.download_image(zip_url, temp_zip):
-                self.signals.log.emit(f"   ❌ Failed to download Ugoira zip file")
+                _safe_emit(self.signals.log, "   ❌ Failed to download Ugoira zip file")
                 if os.path.exists(temp_zip): os.remove(temp_zip)
                 return False
         
-            self.signals.log.emit(f"   🔄 Converting ZIP to animated GIF...")
+            _safe_emit(self.signals.log, "   🔄 Converting Ugoira ZIP to MP4 video...")
             pil_frames = []
             durations = []
+            total_uncompressed = 0
             with zipfile.ZipFile(temp_zip, 'r') as z:
                 for frame_info in frames:
                     if not self.running: break
                     frame_file = frame_info.get('file')
                     delay = frame_info.get('delay', 100)
+                    try:
+                        zinfo = z.getinfo(frame_file)
+                        if zinfo.file_size > MAX_UGOIRA_FRAME_BYTES:
+                            _safe_emit(self.signals.log, f"   ⚠️ Skipping oversized Ugoira frame ({zinfo.file_size} bytes)")
+                            continue
+                        total_uncompressed += zinfo.file_size
+                        if total_uncompressed > MAX_UGOIRA_TOTAL_BYTES:
+                            _safe_emit(self.signals.log, "   ⚠️ Ugoira archive exceeded safe memory limit, stopping frame extraction.")
+                            break
+                    except KeyError:
+                        continue
                     with z.open(frame_file) as f:
                         img = Image.open(io.BytesIO(f.read()))
                         pil_frames.append(img.convert('RGB'))
@@ -1088,23 +1347,32 @@ class PixivDownloaderWorker(QRunnable):
                     except Exception: pass
                 return False
 
+            saved_path = None
             if pil_frames:
-                os.makedirs(os.path.dirname(gif_filepath), exist_ok=True)
-                pil_frames[0].save(
-                    gif_filepath,
-                    save_all=True,
-                    append_images=pil_frames[1:],
-                    duration=durations,
-                    loop=0
-                )
-                self.register_file_in_db(gif_filepath, artist_id, artist_name)
+                os.makedirs(os.path.dirname(mp4_filepath), exist_ok=True)
+                if convert_frames_to_mp4(pil_frames, durations, mp4_filepath):
+                    saved_path = mp4_filepath
+                    _safe_emit(self.signals.log, f"   ✅ Saved Ugoira as MP4: {mp4_filename}")
+                else:
+                    # Fallback to GIF only if OpenCV MP4 encoding is unavailable
+                    pil_frames[0].save(
+                        gif_filepath,
+                        save_all=True,
+                        append_images=pil_frames[1:],
+                        duration=durations,
+                        loop=0
+                    )
+                    saved_path = gif_filepath
+                    _safe_emit(self.signals.log, f"   ✅ Saved Ugoira as GIF (fallback): {os.path.basename(gif_filepath)}")
+                self.register_file_in_db(saved_path, artist_id, artist_name)
             if os.path.exists(temp_zip):
                 os.remove(temp_zip)
-            return True
+            return saved_path is not None
         except Exception as e:
-            self.signals.log.emit(f"   ❌ Error processing Ugoira: {e}")
-            if 'temp_zip' in locals() and os.path.exists(temp_zip):
-                os.remove(temp_zip)
+            _safe_emit(self.signals.log, f"   ❌ Error processing Ugoira: {e}")
+            if temp_zip and os.path.exists(temp_zip):
+                try: os.remove(temp_zip)
+                except Exception: pass
             return False
 
     def get_illust_pages(self, ill_id, headers, ill_body):
@@ -1120,7 +1388,7 @@ class PixivDownloaderWorker(QRunnable):
                         if pages:
                             return pages
             except Exception as e:
-                self.signals.log.emit(f"   ⚠️ Failed to fetch pages details for Illust {ill_id}: {e}")
+                _safe_emit(self.signals.log, f"   ⚠️ Failed to fetch pages details for Illust {ill_id}: {e}")
     
         # Fallback to single page urls.original
         orig_url = ill_body.get('urls', {}).get('original')
@@ -1141,19 +1409,19 @@ class PixivDownloaderWorker(QRunnable):
             clean_cookie = clean_cookie.strip("; \"'")
             if clean_cookie:
                 headers['Cookie'] = f"PHPSESSID={clean_cookie}"
-                self.signals.log.emit("🔑 Using PHPSESSID cookie for authenticated metadata query.")
+                _safe_emit(self.signals.log, "🔑 Using PHPSESSID cookie for authenticated metadata query.")
     
         if self.mode == 'ILLUST':
-            self.signals.log.emit(f"🔍 Fetching illust metadata for ID: {self.target_id}...")
+            _safe_emit(self.signals.log, f"🔍 Fetching illust metadata for ID: {self.target_id}...")
             url = f"https://www.pixiv.net/ajax/illust/{self.target_id}"
             try:
                 r = requests.get(url, headers=headers, timeout=10)
                 if r.status_code != 200:
-                    self.signals.finished.emit(False, f"HTTP Error {r.status_code} when fetching illust data.")
+                    _safe_emit(self.signals.finished, False, f"HTTP Error {r.status_code} when fetching illust data.")
                     return
                 data = r.json()
                 if data.get('error'):
-                    self.signals.finished.emit(False, f"Pixiv API Error: {data.get('message', 'Unknown error')}")
+                    _safe_emit(self.signals.finished, False, f"Pixiv API Error: {data.get('message', 'Unknown error')}")
                     return
             
                 body = data.get('body', {})
@@ -1169,24 +1437,24 @@ class PixivDownloaderWorker(QRunnable):
                 x_restrict = body.get('xRestrict', 0)
             
                 if x_restrict > 0 and not self.cookie:
-                    self.signals.log.emit("   ⚠️ Warning: This artwork is R-18 / R-18G. Pixiv requires a valid PHPSESSID cookie to download adult content.")
+                    _safe_emit(self.signals.log, "   ⚠️ Warning: This artwork is R-18 / R-18G. Pixiv requires a valid PHPSESSID cookie to download adult content.")
             
                 if illust_type == 2:
-                    self.signals.log.emit(f"🎬 Illust ID {self.target_id} is a Ugoira (Animation). Processing...")
+                    _safe_emit(self.signals.log, f"🎬 Illust ID {self.target_id} is a Ugoira (Animation). Processing...")
                     filename_prefix = f"{self.target_id}_ugoira - {clean_title}" if clean_title else f"{self.target_id}_ugoira"
                     success = self.process_ugoira(self.target_id, headers, dest_dir, filename_prefix, artist_id=artist_id, artist_name=artist_name)
                     fail_msg = "Ugoira download failed (R-18 works require PHPSESSID cookie)" if (x_restrict > 0 and not self.cookie) else "Ugoira download failed"
-                    self.signals.finished.emit(success, f"Finished downloading Ugoira {self.target_id}" if success else fail_msg)
+                    _safe_emit(self.signals.finished, success, f"Finished downloading Ugoira {self.target_id}" if success else fail_msg)
                     return
 
                 pages = self.get_illust_pages(self.target_id, headers, body)
                 if not pages and x_restrict > 0 and not self.cookie:
-                    self.signals.log.emit("   ❌ Cannot download R-18 image files without authentication. Please enter your PHPSESSID cookie in the download dialog.")
-                    self.signals.finished.emit(False, "R-18 work requires PHPSESSID cookie to download.")
+                    _safe_emit(self.signals.log, "   ❌ Cannot download R-18 image files without authentication. Please enter your PHPSESSID cookie in the download dialog.")
+                    _safe_emit(self.signals.finished, False, "R-18 work requires PHPSESSID cookie to download.")
                     return
             
                 total_pages = len(pages)
-                self.signals.log.emit(f"🎨 Artist: {artist_name} | Found {total_pages} page(s)")
+                _safe_emit(self.signals.log, f"🎨 Artist: {artist_name} | Found {total_pages} page(s)")
             
                 downloaded = 0
                 for idx, page in enumerate(pages):
@@ -1200,42 +1468,42 @@ class PixivDownloaderWorker(QRunnable):
                     dest_file = os.path.join(dest_dir, filename)
                 
                     if os.path.exists(dest_file):
-                        self.signals.log.emit(f"⏭️ File already exists, skipping: {filename}")
+                        _safe_emit(self.signals.log, f"⏭️ File already exists, skipping: {filename}")
                         downloaded += 1
-                        self.signals.progress.emit(downloaded, total_pages)
+                        _safe_emit(self.signals.progress, downloaded, total_pages)
                         continue
                 
-                    self.signals.log.emit(f"📥 Downloading page {idx+1}/{total_pages}: {filename}...")
+                    _safe_emit(self.signals.log, f"📥 Downloading page {idx+1}/{total_pages}: {filename}...")
                     if self.download_image(orig_url, dest_file):
                         downloaded += 1
-                        self.signals.log.emit(f"✅ Success: {filename}")
+                        _safe_emit(self.signals.log, f"✅ Success: {filename}")
                         self.register_file_in_db(dest_file, artist_id, artist_name)
-                    self.signals.progress.emit(downloaded, total_pages)
+                    _safe_emit(self.signals.progress, downloaded, total_pages)
                 
                     if idx < total_pages - 1:
                         delay = random.uniform(2.0, 4.0)
-                        self.signals.log.emit(f"💤 Sleeping for {delay:.1f}s (Safe Mode)...")
+                        _safe_emit(self.signals.log, f"💤 Sleeping for {delay:.1f}s (Safe Mode)...")
                         self.interruptible_sleep(delay)
             
                 if not self.running:
-                    self.signals.finished.emit(False, "Download cancelled by user.")
+                    _safe_emit(self.signals.finished, False, "Download cancelled by user.")
                     return
 
-                self.signals.finished.emit(True, f"Finished downloading illust {self.target_id}")
+                _safe_emit(self.signals.finished, True, f"Finished downloading illust {self.target_id}")
             except Exception as e:
-                self.signals.finished.emit(False, str(e))
+                _safe_emit(self.signals.finished, False, str(e))
 
         elif self.mode == 'ARTIST':
-            self.signals.log.emit(f"🔍 Fetching artist profile for ID: {self.target_id}...")
+            _safe_emit(self.signals.log, f"🔍 Fetching artist profile for ID: {self.target_id}...")
             url = f"https://www.pixiv.net/ajax/user/{self.target_id}/profile/all"
             try:
                 r = requests.get(url, headers=headers, timeout=15)
                 if r.status_code != 200:
-                    self.signals.finished.emit(False, f"HTTP Error {r.status_code} when fetching artist profile.")
+                    _safe_emit(self.signals.finished, False, f"HTTP Error {r.status_code} when fetching artist profile.")
                     return
                 data = r.json()
                 if data.get('error'):
-                    self.signals.finished.emit(False, f"Pixiv API Error: {data.get('message', 'Unknown error')}")
+                    _safe_emit(self.signals.finished, False, f"Pixiv API Error: {data.get('message', 'Unknown error')}")
                     return
             
                 body = data.get('body', {})
@@ -1247,10 +1515,10 @@ class PixivDownloaderWorker(QRunnable):
                 total_illusts = len(illust_ids)
             
                 if total_illusts == 0:
-                    self.signals.finished.emit(True, "Artist has no illustrations or manga.")
+                    _safe_emit(self.signals.finished, True, "Artist has no illustrations or manga.")
                     return
             
-                self.signals.log.emit(f"🎨 Found {total_illusts} works for Artist ID: {self.target_id}")
+                _safe_emit(self.signals.log, f"🎨 Found {total_illusts} works for Artist ID: {self.target_id}")
             
                 artist_name = "Artist " + self.target_id
                 first_url = f"https://www.pixiv.net/ajax/illust/{illust_ids[0]}"
@@ -1262,7 +1530,7 @@ class PixivDownloaderWorker(QRunnable):
             
                 artist_folder = self.target_id
                 dest_dir = os.path.join(self.output_dir, artist_folder)
-                self.signals.log.emit(f"📁 Destination Folder: {dest_dir}")
+                _safe_emit(self.signals.log, f"📁 Destination Folder: {dest_dir}")
             
                 # Scan destination folder first to get already downloaded IDs
                 downloaded_ids = set()
@@ -1277,10 +1545,10 @@ class PixivDownloaderWorker(QRunnable):
                 new_illust_ids = [i for i in illust_ids if i not in downloaded_ids]
                 total_new = len(new_illust_ids)
             
-                self.signals.log.emit(f"🎨 Found {total_illusts} works total. {total_illusts - total_new} already exist in storage. {total_new} new works to download.")
+                _safe_emit(self.signals.log, f"🎨 Found {total_illusts} works total. {total_illusts - total_new} already exist in storage. {total_new} new works to download.")
             
                 if total_new == 0:
-                    self.signals.finished.emit(True, "All illustrations of this artist are already downloaded.")
+                    _safe_emit(self.signals.finished, True, "All illustrations of this artist are already downloaded.")
                     return
             
                 downloaded_works = 0
@@ -1288,7 +1556,7 @@ class PixivDownloaderWorker(QRunnable):
                 for idx, ill_id in enumerate(new_illust_ids):
                     if not self.running: break
                 
-                    self.signals.log.emit(f"🖼️ [{idx+1}/{total_new}] Fetching metadata for Illust ID {ill_id}...")
+                    _safe_emit(self.signals.log, f"🖼️ [{idx+1}/{total_new}] Fetching metadata for Illust ID {ill_id}...")
                 
                     illust_url = f"https://www.pixiv.net/ajax/illust/{ill_id}"
                     try:
@@ -1304,22 +1572,23 @@ class PixivDownloaderWorker(QRunnable):
                             
                                 if illust_type == 2:
                                     filename_prefix = f"{ill_id}_ugoira - {clean_title}" if clean_title else f"{ill_id}_ugoira"
+                                    mp4_filepath = os.path.join(dest_dir, f"{filename_prefix}.mp4")
                                     gif_filepath = os.path.join(dest_dir, f"{filename_prefix}.gif")
-                                    if os.path.exists(gif_filepath):
-                                        self.signals.log.emit(f"   ⏭️ Skipping existing Ugoira: {filename_prefix}.gif")
+                                    if os.path.exists(mp4_filepath) or os.path.exists(gif_filepath):
+                                        _safe_emit(self.signals.log, f"   ⏭️ Skipping existing Ugoira: {filename_prefix}.mp4")
                                     else:
-                                        self.signals.log.emit(f"   🎬 Illust ID {ill_id} is a Ugoira (Animation). Processing...")
+                                        _safe_emit(self.signals.log, f"   🎬 Illust ID {ill_id} is a Ugoira (Animation). Processing...")
                                         if self.process_ugoira(ill_id, headers, dest_dir, filename_prefix, artist_id=self.target_id, artist_name=artist_name):
                                             downloaded_works += 1
                                 
                                     if self.max_limit and downloaded_works >= self.max_limit:
-                                        self.signals.log.emit(f"🛑 Reached download limit of {self.max_limit} works. Stopping.")
-                                        self.signals.finished.emit(True, f"Reached download limit of {self.max_limit} works.")
+                                        _safe_emit(self.signals.log, f"🛑 Reached download limit of {self.max_limit} works. Stopping.")
+                                        _safe_emit(self.signals.finished, True, f"Reached download limit of {self.max_limit} works.")
                                         return
                                 else:
                                     pages = self.get_illust_pages(ill_id, headers, ill_body)
                                     if not pages and x_restrict > 0 and not self.cookie:
-                                        self.signals.log.emit(f"   ⚠️ Skipping R-18 Illust ID {ill_id} (Requires PHPSESSID cookie)")
+                                        _safe_emit(self.signals.log, f"   ⚠️ Skipping R-18 Illust ID {ill_id} (Requires PHPSESSID cookie)")
                                         continue
                                 
                                     has_downloaded_any_page = False
@@ -1334,12 +1603,12 @@ class PixivDownloaderWorker(QRunnable):
                                         dest_file = os.path.join(dest_dir, filename)
                                     
                                         if os.path.exists(dest_file):
-                                             self.signals.log.emit(f"   ⏭️ Skipping existing: {filename}")
+                                             _safe_emit(self.signals.log, f"   ⏭️ Skipping existing: {filename}")
                                              continue
                                         
-                                        self.signals.log.emit(f"   📥 Downloading page {p_idx+1}: {filename}...")
+                                        _safe_emit(self.signals.log, f"   📥 Downloading page {p_idx+1}: {filename}...")
                                         if self.download_image(orig_url, dest_file):
-                                            self.signals.log.emit(f"   ✅ Success: {filename}")
+                                            _safe_emit(self.signals.log, f"   ✅ Success: {filename}")
                                             has_downloaded_any_page = True
                                             self.register_file_in_db(dest_file, self.target_id, artist_name)
                                     
@@ -1350,31 +1619,31 @@ class PixivDownloaderWorker(QRunnable):
                                         downloaded_works += 1
                                     
                                     if self.max_limit and downloaded_works >= self.max_limit:
-                                        self.signals.log.emit(f"🛑 Reached download limit of {self.max_limit} works. Stopping.")
-                                        self.signals.finished.emit(True, f"Reached download limit of {self.max_limit} works.")
+                                        _safe_emit(self.signals.log, f"🛑 Reached download limit of {self.max_limit} works. Stopping.")
+                                        _safe_emit(self.signals.finished, True, f"Reached download limit of {self.max_limit} works.")
                                         return
                     except Exception as e:
-                        self.signals.log.emit(f"   ❌ Error fetching details for Illust {ill_id}: {e}")
+                        _safe_emit(self.signals.log, f"   ❌ Error fetching details for Illust {ill_id}: {e}")
                 
-                    self.signals.progress.emit(idx + 1, total_new)
+                    _safe_emit(self.signals.progress, idx + 1, total_new)
                 
                     if idx < total_new - 1:
                         if (idx + 1) % 10 == 0:
                             session_delay = random.uniform(15.0, 30.0)
-                            self.signals.log.emit(f"☕ [SESSION BREAK] Sleeping {session_delay:.1f}s to mimic human breaks...")
+                            _safe_emit(self.signals.log, f"☕ [SESSION BREAK] Sleeping {session_delay:.1f}s to mimic human breaks...")
                             self.interruptible_sleep(session_delay)
                         else:
                             delay = random.uniform(3.0, 5.0)
-                            self.signals.log.emit(f"💤 Sleeping for {delay:.1f}s...")
+                            _safe_emit(self.signals.log, f"💤 Sleeping for {delay:.1f}s...")
                             self.interruptible_sleep(delay)
             
                 if not self.running:
-                    self.signals.finished.emit(False, "Download cancelled by user.")
+                    _safe_emit(self.signals.finished, False, "Download cancelled by user.")
                     return
 
-                self.signals.finished.emit(True, f"Finished downloading gallery for Artist {self.target_id}")
+                _safe_emit(self.signals.finished, True, f"Finished downloading gallery for Artist {self.target_id}")
             except Exception as e:
-                self.signals.finished.emit(False, str(e))
+                _safe_emit(self.signals.finished, False, str(e))
 
         elif self.mode == 'BOOKMARK':
             limit = 48
@@ -1387,7 +1656,7 @@ class PixivDownloaderWorker(QRunnable):
                 page_str += f" to {self.end_page}"
             else:
                 page_str += " onwards"
-            self.signals.log.emit(f"🔍 Fetching bookmarks list for User: {self.target_id} ({self.bookmark_rest}) | Range: {page_str}...")
+            _safe_emit(self.signals.log, f"🔍 Fetching bookmarks list for User: {self.target_id} ({self.bookmark_rest}) | Range: {page_str}...")
         
             try:
                 while self.running:
@@ -1398,12 +1667,12 @@ class PixivDownloaderWorker(QRunnable):
                     url = f"https://www.pixiv.net/ajax/user/{self.target_id}/illusts/bookmarks?tag=&offset={offset}&limit={limit}&rest={self.bookmark_rest}"
                     r = requests.get(url, headers=headers, timeout=15)
                     if r.status_code != 200:
-                        self.signals.finished.emit(False, f"HTTP Error {r.status_code} while fetching bookmark offset {offset}")
+                        _safe_emit(self.signals.finished, False, f"HTTP Error {r.status_code} while fetching bookmark offset {offset}")
                         return
                 
                     data = r.json()
                     if data.get('error'):
-                        self.signals.finished.emit(False, f"Pixiv API Error: {data.get('message', 'Unknown error')}")
+                        _safe_emit(self.signals.finished, False, f"Pixiv API Error: {data.get('message', 'Unknown error')}")
                         return
                 
                     body = data.get('body', {})
@@ -1417,19 +1686,19 @@ class PixivDownloaderWorker(QRunnable):
                             illust_ids.append(ill_id)
                 
                     offset += limit
-                    self.signals.log.emit(f"📋 Found {len(illust_ids)} bookmarks so far (Current: Page {current_page})...")
+                    _safe_emit(self.signals.log, f"📋 Found {len(illust_ids)} bookmarks so far (Current: Page {current_page})...")
                     self.interruptible_sleep(1.0)  # Small metadata fetch safety delay
             
                 if not self.running:
-                    self.signals.finished.emit(False, "Download cancelled by user.")
+                    _safe_emit(self.signals.finished, False, "Download cancelled by user.")
                     return
 
                 total_illusts = len(illust_ids)
                 if total_illusts == 0:
-                    self.signals.finished.emit(True, "No bookmarked illustrations found in this range.")
+                    _safe_emit(self.signals.finished, True, "No bookmarked illustrations found in this range.")
                     return
             
-                self.signals.log.emit(f"🚀 Total bookmarked illustrations collected: {total_illusts}")
+                _safe_emit(self.signals.log, f"🚀 Total bookmarked illustrations collected: {total_illusts}")
             
                 # Scan output folders (which are artist folders) to get already downloaded IDs
                 downloaded_ids = set()
@@ -1447,10 +1716,10 @@ class PixivDownloaderWorker(QRunnable):
                 new_illust_ids = [i for i in illust_ids if i not in downloaded_ids]
                 total_new = len(new_illust_ids)
             
-                self.signals.log.emit(f"🚀 Collected {total_illusts} bookmarks total. {total_illusts - total_new} already exist in storage. {total_new} new works to download.")
+                _safe_emit(self.signals.log, f"🚀 Collected {total_illusts} bookmarks total. {total_illusts - total_new} already exist in storage. {total_new} new works to download.")
             
                 if total_new == 0:
-                    self.signals.finished.emit(True, "All bookmarked illustrations are already downloaded.")
+                    _safe_emit(self.signals.finished, True, "All bookmarked illustrations are already downloaded.")
                     return
             
                 downloaded_works = 0
@@ -1458,7 +1727,7 @@ class PixivDownloaderWorker(QRunnable):
                 for idx, ill_id in enumerate(new_illust_ids):
                     if not self.running: break
                 
-                    self.signals.log.emit(f"🖼️ [{idx+1}/{total_new}] Fetching metadata for Bookmarked Illust ID {ill_id}...")
+                    _safe_emit(self.signals.log, f"🖼️ [{idx+1}/{total_new}] Fetching metadata for Bookmarked Illust ID {ill_id}...")
                 
                     illust_url = f"https://www.pixiv.net/ajax/illust/{ill_id}"
                     try:
@@ -1478,22 +1747,23 @@ class PixivDownloaderWorker(QRunnable):
                             
                                 if illust_type == 2:
                                     filename_prefix = f"{ill_id}_ugoira - {clean_title}" if clean_title else f"{ill_id}_ugoira"
+                                    mp4_filepath = os.path.join(artist_dir, f"{filename_prefix}.mp4")
                                     gif_filepath = os.path.join(artist_dir, f"{filename_prefix}.gif")
-                                    if os.path.exists(gif_filepath):
-                                        self.signals.log.emit(f"   ⏭️ Skipping existing Ugoira: {filename_prefix}.gif")
+                                    if os.path.exists(mp4_filepath) or os.path.exists(gif_filepath):
+                                        _safe_emit(self.signals.log, f"   ⏭️ Skipping existing Ugoira: {filename_prefix}.mp4")
                                     else:
-                                        self.signals.log.emit(f"   🎬 Bookmarked Illust ID {ill_id} is a Ugoira (Animation). Processing...")
+                                        _safe_emit(self.signals.log, f"   🎬 Bookmarked Illust ID {ill_id} is a Ugoira (Animation). Processing...")
                                         if self.process_ugoira(ill_id, headers, artist_dir, filename_prefix, artist_id=artist_id, artist_name=artist_name):
                                             downloaded_works += 1
                                 
                                     if self.max_limit and downloaded_works >= self.max_limit:
-                                        self.signals.log.emit(f"🛑 Reached download limit of {self.max_limit} works. Stopping.")
-                                        self.signals.finished.emit(True, f"Reached download limit of {self.max_limit} works.")
+                                        _safe_emit(self.signals.log, f"🛑 Reached download limit of {self.max_limit} works. Stopping.")
+                                        _safe_emit(self.signals.finished, True, f"Reached download limit of {self.max_limit} works.")
                                         return
                                 else:
                                     pages = self.get_illust_pages(ill_id, headers, ill_body)
                                     if not pages and x_restrict > 0 and not self.cookie:
-                                        self.signals.log.emit(f"   ⚠️ Skipping R-18 Bookmarked Illust ID {ill_id} (Requires PHPSESSID cookie)")
+                                        _safe_emit(self.signals.log, f"   ⚠️ Skipping R-18 Bookmarked Illust ID {ill_id} (Requires PHPSESSID cookie)")
                                         continue
                                 
                                     has_downloaded_any_page = False
@@ -1508,12 +1778,12 @@ class PixivDownloaderWorker(QRunnable):
                                         dest_file = os.path.join(artist_dir, filename)
                                     
                                         if os.path.exists(dest_file):
-                                            self.signals.log.emit(f"   ⏭️ Skipping existing: {filename}")
+                                            _safe_emit(self.signals.log, f"   ⏭️ Skipping existing: {filename}")
                                             continue
                                         
-                                        self.signals.log.emit(f"   📥 Downloading page {p_idx+1}: {filename}...")
+                                        _safe_emit(self.signals.log, f"   📥 Downloading page {p_idx+1}: {filename}...")
                                         if self.download_image(orig_url, dest_file):
-                                            self.signals.log.emit(f"   ✅ Success: {filename}")
+                                            _safe_emit(self.signals.log, f"   ✅ Success: {filename}")
                                             has_downloaded_any_page = True
                                             self.register_file_in_db(dest_file, artist_id, artist_name)
                                     
@@ -1524,31 +1794,31 @@ class PixivDownloaderWorker(QRunnable):
                                         downloaded_works += 1
                                     
                                     if self.max_limit and downloaded_works >= self.max_limit:
-                                        self.signals.log.emit(f"🛑 Reached download limit of {self.max_limit} works. Stopping.")
-                                        self.signals.finished.emit(True, f"Reached download limit of {self.max_limit} works.")
+                                        _safe_emit(self.signals.log, f"🛑 Reached download limit of {self.max_limit} works. Stopping.")
+                                        _safe_emit(self.signals.finished, True, f"Reached download limit of {self.max_limit} works.")
                                         return
                     except Exception as e:
-                        self.signals.log.emit(f"   ❌ Error fetching details for Illust {ill_id}: {e}")
+                        _safe_emit(self.signals.log, f"   ❌ Error fetching details for Illust {ill_id}: {e}")
                 
-                    self.signals.progress.emit(idx + 1, total_new)
+                    _safe_emit(self.signals.progress, idx + 1, total_new)
                 
                     if idx < total_new - 1:
                         if (idx + 1) % 10 == 0:
                             session_delay = random.uniform(15.0, 30.0)
-                            self.signals.log.emit(f"☕ [SESSION BREAK] Sleeping {session_delay:.1f}s to mimic human breaks...")
+                            _safe_emit(self.signals.log, f"☕ [SESSION BREAK] Sleeping {session_delay:.1f}s to mimic human breaks...")
                             self.interruptible_sleep(session_delay)
                         else:
                             delay = random.uniform(3.0, 5.0)
-                            self.signals.log.emit(f"💤 Sleeping for {delay:.1f}s...")
+                            _safe_emit(self.signals.log, f"💤 Sleeping for {delay:.1f}s...")
                             self.interruptible_sleep(delay)
             
                 if not self.running:
-                    self.signals.finished.emit(False, "Download cancelled by user.")
+                    _safe_emit(self.signals.finished, False, "Download cancelled by user.")
                     return
 
-                self.signals.finished.emit(True, f"Finished downloading bookmarks for User {self.target_id}")
+                _safe_emit(self.signals.finished, True, f"Finished downloading bookmarks for User {self.target_id}")
             except Exception as e:
-                self.signals.finished.emit(False, str(e))
+                _safe_emit(self.signals.finished, False, str(e))
 
 class DatabaseOptimizerWorker(QRunnable):
     def __init__(self, db_file):
@@ -1559,14 +1829,17 @@ class DatabaseOptimizerWorker(QRunnable):
     @pyqtSlot()
     def run(self):
         try:
+            from database import cleanup_orphaned_records
+            close_all_thread_local_conns()
+            cleanup_orphaned_records(self.db_file)
             conn = sqlite3.connect(self.db_file, timeout=60.0)
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             conn.execute("VACUUM")
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             conn.close()
-            self.signals.api_log.emit("SUCCESS")
+            _safe_emit(self.signals.api_log, "SUCCESS")
         except Exception as e:
-            self.signals.api_log.emit(f"ERROR: {e}")
+            _safe_emit(self.signals.api_log, f"ERROR: {e}")
 
 class AiTagWorkerSignals(QObject):
     progress = pyqtSignal(int, int, str, float, float)  # current, total, filename, fps, eta_seconds
@@ -1577,15 +1850,13 @@ class AiTagWorkerSignals(QObject):
     paused = pyqtSignal(bool)
     model_loading = pyqtSignal(str)
 
-import queue
 
 class AiTaggingWorker(QRunnable):
     """
-    High-Performance Multi-threaded Asynchronous AI Tagging Worker (DirectML GPU Accelerated):
+    High-Performance Multi-threaded Asynchronous AI Tagging Worker (DirectML / CUDA / NPU Accelerated):
     - Producer-Consumer Architecture: Parallel CPU prefetchers decode images and scale tensors in advance
-    - DirectML GPU consumer executes back-to-back inference with zero disk I/O idle time
+    - DirectML/CUDA/NPU consumer executes back-to-back inference with zero disk I/O idle time
     - Chunked SQLite commits for minimal write lock overhead
-
     """
     def __init__(self, root_path=None, db_file=DB_FILE, use_gpu=True,
                  use_fp16=True,
@@ -1593,7 +1864,8 @@ class AiTaggingWorker(QRunnable):
                  storage_mode="auto",
                  char_threshold=DEFAULT_CHARACTER_THRESHOLD,
                  gen_threshold=DEFAULT_GENERAL_THRESHOLD,
-                 rescan_existing=False, batch_size=50, throttle=0.0):
+                 rescan_existing=False, batch_size=50, throttle=0.0,
+                 inference_batch=16):
         super().__init__()
         self.root_path = root_path
         self.db_file = db_file
@@ -1606,6 +1878,7 @@ class AiTaggingWorker(QRunnable):
         self.rescan_existing = rescan_existing
         self.batch_size = batch_size
         self.throttle = throttle
+        self.inference_batch = max(1, int(inference_batch or 16))
         self.signals = AiTagWorkerSignals()
         self.running = True
         self.is_paused = False
@@ -1614,13 +1887,13 @@ class AiTaggingWorker(QRunnable):
     def pause(self):
         with self._pause_cond:
             self.is_paused = True
-            self.signals.paused.emit(True)
+            _safe_emit(self.signals.paused, True)
 
     def resume(self):
         with self._pause_cond:
             self.is_paused = False
             self._pause_cond.notify_all()
-            self.signals.paused.emit(False)
+            _safe_emit(self.signals.paused, False)
 
     def stop(self):
         self.running = False
@@ -1632,35 +1905,33 @@ class AiTaggingWorker(QRunnable):
     def run(self):
         from tagger import WD14Tagger, get_model_paths
         if not WD14Tagger.is_model_installed(self.model_key):
-            self.signals.log.emit("⚠️ ไม่พบไฟล์โมเดล AI กรุณาดาวน์โหลดโมเดลก่อนเริ่มสแกน")
-            self.signals.finished.emit(0, 0, 0.0)
+            _safe_emit(self.signals.log, "⚠️ ไม่พบไฟล์โมเดล AI กรุณาดาวน์โหลดโมเดลก่อนเริ่มสแกน")
+            _safe_emit(self.signals.finished, 0, 0, 0.0)
             return
 
         model_meta = get_model_paths(self.model_key)["meta"]
         precision_label = "FP16 (Turbo)" if (self.use_gpu and self.use_fp16) else "FP32 Standard"
-        self.signals.model_loading.emit(f"กำลังโหลด {model_meta['short_name']} ({precision_label}) เข้า GPU...")
+        _safe_emit(self.signals.model_loading, f"กำลังโหลด {model_meta['short_name']} ({precision_label}) เข้า GPU...")
         try:
             tagger = WD14Tagger(model_key=self.model_key, use_gpu=self.use_gpu, use_fp16=self.use_fp16 if self.use_gpu else False)
             tagger.load_model()
-            self.signals.log.emit(f"✅ โหลดโมเดล {model_meta['short_name']} สำเร็จ (ทำงานบน: {tagger.active_provider} | {precision_label})")
+            _safe_emit(self.signals.log, f"✅ โหลดโมเดล {model_meta['short_name']} สำเร็จ (ทำงานบน: {tagger.active_provider} | {precision_label})")
         except Exception as e:
-            self.signals.log.emit(f"❌ โหลดโมเดลไม่สำเร็จ: {e}")
-            self.signals.finished.emit(0, 1, 0.0)
+            _safe_emit(self.signals.log, f"❌ โหลดโมเดลไม่สำเร็จ: {e}")
+            _safe_emit(self.signals.finished, 0, 1, 0.0)
             return
 
         conn = get_thread_local_conn(self.db_file)
         cursor = conn.cursor()
 
-        self.signals.log.emit("🔍 กำลังค้นหาไฟล์ที่ต้องสแกนแท็ก (Direct Disk Walk)...")
+        _safe_emit(self.signals.log, "🔍 กำลังค้นหาไฟล์ที่ต้องสแกนแท็ก (Direct Disk Walk)...")
         target_files = []
         try:
             # 1. Determine search folder on disk
             search_folder = self.root_path
             if not search_folder and self.db_file == DB_FILE:
                 try:
-                    import json
-                    with open('config.json', 'r', encoding='utf-8') as f:
-                        search_folder = json.load(f).get('last_folder')
+                    search_folder = load_app_config().get('last_folder')
                 except Exception:
                     pass
 
@@ -1685,31 +1956,32 @@ class AiTaggingWorker(QRunnable):
             # 3. Filter target files
             if self.rescan_existing:
                 target_files = disk_files
-                self.signals.log.emit(f"🔄 โหมดสแกนใหม่ทั้งหมด (Full Re-scan): เตรียมสแกนทับทั้งหมด {len(target_files):,} ไฟล์...")
+                _safe_emit(self.signals.log, f"🔄 โหมดสแกนใหม่ทั้งหมด (Full Re-scan): เตรียมสแกนทับทั้งหมด {len(target_files):,} ไฟล์...")
             else:
                 if self.root_path:
                     search_prefix = self.root_path + os.sep
                     search_prefix_upper = self.root_path + os.sep + "\uffff"
-                    cursor.execute("SELECT DISTINCT path FROM file_tags WHERE path >= ? AND path < ? AND tag_name != '__none__'", (search_prefix, search_prefix_upper))
+                    cursor.execute("SELECT DISTINCT path FROM file_tags WHERE path >= ? AND path < ? AND tag_name != '__none__' AND category NOT IN (10, 11, 99)", (search_prefix, search_prefix_upper))
                 else:
-                    cursor.execute("SELECT DISTINCT path FROM file_tags WHERE tag_name != '__none__'")
+                    cursor.execute("SELECT DISTINCT path FROM file_tags WHERE tag_name != '__none__' AND category NOT IN (10, 11, 99)")
                 already_tagged_set = {row[0] for row in cursor.fetchall()}
                 target_files = [f for f in disk_files if f not in already_tagged_set]
                 skipped_count = len(disk_files) - len(target_files)
-                self.signals.log.emit(
+                _safe_emit(
+                    self.signals.log,
                     f"⚡ โหมดด่วน (Quick Mode): พบไฟล์ใหม่ที่ยังไม่มีแท็ก {len(target_files):,} ไฟล์ "
                     f"(ข้าม {skipped_count:,} ไฟล์ที่มีแท็กแล้ว จากทั้งหมด {len(disk_files):,} ไฟล์)..."
                 )
 
         except Exception as e:
-            self.signals.log.emit(f"❌ เกิดข้อผิดพลาดในการค้นหาไฟล์: {e}")
-            self.signals.finished.emit(0, 1, 0.0)
+            _safe_emit(self.signals.log, f"❌ เกิดข้อผิดพลาดในการค้นหาไฟล์: {e}")
+            _safe_emit(self.signals.finished, 0, 1, 0.0)
             return
 
         total_files = len(target_files)
         if total_files == 0:
-            self.signals.log.emit("✨ ไม่มีไฟล์ใหม่ที่ต้องสแกนแท็ก (ไฟล์ทั้งหมดมีแท็กครบแล้ว)")
-            self.signals.finished.emit(0, 0, 0.0)
+            _safe_emit(self.signals.log, "✨ ไม่มีไฟล์ใหม่ที่ต้องสแกนแท็ก (ไฟล์ทั้งหมดมีแท็กครบแล้ว)")
+            _safe_emit(self.signals.finished, 0, 0, 0.0)
             return
 
         # Storage profile determination & Auto-detect
@@ -1733,9 +2005,10 @@ class AiTaggingWorker(QRunnable):
         else:
             num_prefetchers = min(16, max(8, (os.cpu_count() or 8) * 2))
 
-        INFERENCE_BATCH = 16  # Stack 16 images per GPU call (RX6800: ~490 FPS theoretical)
+        INFERENCE_BATCH = self.inference_batch
 
-        self.signals.log.emit(
+        _safe_emit(
+            self.signals.log,
             f"🚀 เริ่มการสแกน Turbo Batch Pipeline ทั้งหมด {total_files:,} ไฟล์ "
             f"(GPU Batch={INFERENCE_BATCH} | Storage: {profile_label} [{num_prefetchers} I/O Threads])..."
         )
@@ -1745,6 +2018,18 @@ class AiTaggingWorker(QRunnable):
         error_count = 0
         batch_tags = []
 
+        # Determine model input size, dtype, and NCHW flag dynamically
+        target_size = 448
+        is_nchw = False
+        if len(tagger.input_shape) == 4:
+            if tagger.input_shape[1] == 3:
+                is_nchw = True
+                if isinstance(tagger.input_shape[2], int) and tagger.input_shape[2] > 3:
+                    target_size = tagger.input_shape[2]
+            elif isinstance(tagger.input_shape[1], int) and tagger.input_shape[1] > 3:
+                target_size = tagger.input_shape[1]
+        target_dtype = tagger.input_dtype
+
         # Multi-threaded Producer-Consumer Prefetch Pipeline
         prefetch_queue = queue.Queue(maxsize=INFERENCE_BATCH * 8)  # Deep buffer: always have next batch ready
         idx_queue = queue.Queue()
@@ -1752,8 +2037,6 @@ class AiTaggingWorker(QRunnable):
             idx_queue.put((idx, fp))
 
         def prefetch_worker():
-            _TARGET_SIZE = 448  # WD14 model input size
-
             while self.running and not idx_queue.empty():
                 with self._pause_cond:
                     while self.is_paused and self.running:
@@ -1772,23 +2055,16 @@ class AiTaggingWorker(QRunnable):
                     elif _CV2_AVAILABLE:
                         ext = os.path.splitext(path)[1].lower()
                         if ext in ('.jpg', '.jpeg', '.png', '.webp', '.bmp'):
-                            # --- cv2 fast path: releases GIL, true thread parallelism ---
-                            # Use np.fromfile + imdecode to support Unicode paths on Windows
-                            raw = np.fromfile(path, dtype=np.uint8)
-                            img = _cv2.imdecode(raw, _cv2.IMREAD_COLOR)
-                            if img is not None:
-                                h, w = img.shape[:2]
-                                scale = _TARGET_SIZE / max(h, w)
-                                nw = max(1, int(w * scale))
-                                nh = max(1, int(h * scale))
-                                img = _cv2.resize(img, (nw, nh), interpolation=_cv2.INTER_LINEAR)
-                                padded = np.full((_TARGET_SIZE, _TARGET_SIZE, 3), 255, dtype=np.float16)
-                                px = (_TARGET_SIZE - nw) // 2
-                                py = (_TARGET_SIZE - nh) // 2
-                                padded[py:py+nh, px:px+nw] = img.astype(np.float16)
-                                tensor = np.expand_dims(padded, axis=0)  # (1, 448, 448, 3)
+                            tensor = decode_image_cv2_for_wd14(
+                                path,
+                                target_size=target_size,
+                                target_dtype=target_dtype,
+                                nchw=is_nchw
+                            )
+                            if tensor is None:
+                                tensor = tagger.prepare_media_tensor(path)
                         else:
-                            # PIL fallback for GIF / ZIP / other formats
+                            # PIL fallback for GIF / ZIP / MP4 / other formats
                             tensor = tagger.prepare_media_tensor(path)
                     else:
                         # PIL fallback when cv2 not available
@@ -1804,7 +2080,7 @@ class AiTaggingWorker(QRunnable):
                     except queue.Full:
                         continue
 
-        # Spawn parallel prefetch threads — scaled to keep GPU fully fed at batch=16
+        # Spawn parallel prefetch threads
         prefetch_threads = []
         for _ in range(num_prefetchers):
             t = threading.Thread(target=prefetch_worker, daemon=True)
@@ -1818,7 +2094,7 @@ class AiTaggingWorker(QRunnable):
                 while self.is_paused and self.running:
                     self._pause_cond.wait(0.2)
             if not self.running:
-                self.signals.log.emit("🛑 การสแกนถูกหยุดโดยผู้ใช้")
+                _safe_emit(self.signals.log, "🛑 การสแกนถูกหยุดโดยผู้ใช้")
                 break
 
             # Collect up to INFERENCE_BATCH items from prefetch queue
@@ -1847,7 +2123,7 @@ class AiTaggingWorker(QRunnable):
             if valid_items:
                 try:
                     fps_list, tensors = zip(*valid_items)
-                    stacked = np.concatenate(tensors, axis=0)  # (N, 448, 448, 3)
+                    stacked = np.concatenate(tensors, axis=0)
                     batch_results = tagger.predict_tensor_batch(
                         stacked,
                         char_threshold=self.char_threshold,
@@ -1857,12 +2133,8 @@ class AiTaggingWorker(QRunnable):
                         per_file_results[fp] = res
                 except Exception as e:
                     logging.error(f"Batch inference error: {e}")
-                    # Mark all as failed so they fall into error path below
                     for fp, _ in valid_items:
                         per_file_results[fp] = None
-
-            t_batch = time.time() - t0
-            per_item_time = t_batch / max(len(current_batch), 1)
 
             # Process each item's result and emit progress
             for _, file_path, tensor in current_batch:
@@ -1870,13 +2142,12 @@ class AiTaggingWorker(QRunnable):
                 res = per_file_results.get(file_path)
 
                 if tensor is None:
-                    # File missing or failed to decode — do not record dummy tag so it can be retried
                     error_count += 1
                 elif res and res.get("all_tags"):
-                    # Successful inference
                     for tag_name, category, conf in res["all_tags"]:
                         batch_tags.append((file_path, tag_name, category, conf))
-                    self.signals.item_tagged.emit(
+                    _safe_emit(
+                        self.signals.item_tagged,
                         file_path,
                         res.get("characters", []),
                         res.get("series", []),
@@ -1885,20 +2156,17 @@ class AiTaggingWorker(QRunnable):
                     )
                     processed_count += 1
                 else:
-                    # Inference ran successfully but no tags met confidence threshold
                     if res is None and file_path in per_file_results:
                         error_count += 1
                     else:
                         processed_count += 1
-                        # No valid tags detected above threshold — leave database clean without dummy records
 
                 items_processed += 1
 
-                # --- Stable FPS: use wall-clock average (immune to queue wait fluctuation) ---
                 wall_elapsed = time.time() - start_time
                 fps = items_processed / wall_elapsed if wall_elapsed > 0 else 0.0
                 eta_sec = (total_files - items_processed) / fps if fps > 0 else 0.0
-                self.signals.progress.emit(items_processed, total_files, filename, fps, eta_sec)
+                _safe_emit(self.signals.progress, items_processed, total_files, filename, fps, eta_sec)
 
             # Batched commit to SQLite
             if len(batch_tags) >= self.batch_size * 5 or items_processed >= total_files:
@@ -1909,7 +2177,7 @@ class AiTaggingWorker(QRunnable):
                     """, batch_tags)
                     conn.commit()
                     batch_tags = []
-                    self.signals.batch_saved.emit(processed_count)
+                    _safe_emit(self.signals.batch_saved, processed_count)
                 except Exception as e:
                     logging.error(f"Error committing tags batch: {e}")
 
@@ -1931,6 +2199,233 @@ class AiTaggingWorker(QRunnable):
                 logging.error(f"Error committing final tags batch: {e}")
 
         total_elapsed = time.time() - start_time
-        self.signals.log.emit(f"🎉 สแกนเสร็จสิ้น: สำเร็จ {processed_count:,} ไฟล์, ข้อผิดพลาด {error_count} (เวลา {total_elapsed:.1f} วินาที)")
-        self.signals.finished.emit(processed_count, error_count, total_elapsed)
+        _safe_emit(self.signals.log, f"🎉 สแกนเสร็จสิ้น: สำเร็จ {processed_count:,} ไฟล์, ข้อผิดพลาด {error_count} (เวลา {total_elapsed:.1f} วินาที)")
+        _safe_emit(self.signals.finished, processed_count, error_count, total_elapsed)
 
+
+class DuplicateScannerSignals(QObject):
+    progress = pyqtSignal(int, int, str)
+    finished = pyqtSignal(list)
+
+
+class DuplicateScannerWorker(QRunnable):
+    """
+    Background Perceptual Hash (dHash) Duplicate & Similar Artwork Scanner.
+    Caches 64-bit dHash values in `file_index.dhash` and groups visually identical/similar files.
+    """
+    def __init__(self, root_path=None, db_file=DB_FILE, max_hamming_distance=4):
+        super().__init__()
+        self.root_path = root_path
+        self.db_file = db_file
+        self.max_hamming_distance = max(0, int(max_hamming_distance))
+        self.signals = DuplicateScannerSignals()
+        self.running = True
+
+    def stop(self):
+        self.running = False
+
+    @pyqtSlot()
+    def run(self):
+        conn = get_thread_local_conn(self.db_file)
+        cursor = conn.cursor()
+        files_info = []
+        try:
+            if self.root_path:
+                prefix = self.root_path + os.sep
+                prefix_upper = prefix + "\uffff"
+                cursor.execute(
+                    "SELECT path, size, mtime, dhash FROM file_index WHERE path >= ? AND path < ?",
+                    (prefix, prefix_upper)
+                )
+            else:
+                cursor.execute("SELECT path, size, mtime, dhash FROM file_index")
+            files_info = cursor.fetchall()
+        except Exception as e:
+            logging.error(f"Error querying file_index for duplicate scan: {e}")
+
+        if not files_info and self.root_path and os.path.exists(self.root_path):
+            for dp, _, fns in os.walk(self.root_path):
+                for fn in fns:
+                    if not fn.startswith('.') and os.path.splitext(fn)[1].lower() in ALL_MEDIA_EXT:
+                        fp = os.path.join(dp, fn)
+                        try:
+                            st = os.stat(fp)
+                            files_info.append((fp, st.st_size, st.st_mtime, None))
+                        except OSError:
+                            pass
+
+        total = len(files_info)
+        if total == 0:
+            _safe_emit(self.signals.finished, [])
+            return
+
+        hashed_items = []
+        db_updates = []
+
+        for idx, (path, size, mtime, dhash) in enumerate(files_info):
+            if not self.running:
+                break
+            if not os.path.exists(path):
+                continue
+            if not dhash:
+                pil_img, _ = load_media_thumbnail(path)
+                if pil_img:
+                    dhash = compute_dhash(pil_img)
+                    if dhash:
+                        db_updates.append((dhash, path))
+            if dhash:
+                hashed_items.append((path, size or 0, mtime or 0.0, dhash))
+
+            if len(db_updates) >= 200:
+                try:
+                    cursor.executemany("UPDATE file_index SET dhash = ? WHERE path = ?", db_updates)
+                    conn.commit()
+                    db_updates = []
+                except Exception:
+                    pass
+
+            if (idx + 1) % 25 == 0 or idx + 1 == total:
+                _safe_emit(self.signals.progress, idx + 1, total, os.path.basename(path))
+
+        if db_updates:
+            try:
+                cursor.executemany("UPDATE file_index SET dhash = ? WHERE path = ?", db_updates)
+                conn.commit()
+            except Exception:
+                pass
+
+        if not self.running:
+            _safe_emit(self.signals.finished, [])
+            return
+
+        # Group duplicates
+        groups = []
+        if self.max_hamming_distance == 0:
+            by_hash = {}
+            for item in hashed_items:
+                by_hash.setdefault(item[3], []).append(item)
+            for h, items in by_hash.items():
+                if len(items) > 1:
+                    items.sort(key=lambda x: x[1], reverse=True)
+                    groups.append(items)
+        else:
+            # Bucket first by exact hash, then compare unique hashes
+            by_hash = {}
+            for item in hashed_items:
+                by_hash.setdefault(item[3], []).append(item)
+            unique_hashes = list(by_hash.keys())
+            visited = set()
+            for i, h1 in enumerate(unique_hashes):
+                if not self.running:
+                    break
+                if h1 in visited:
+                    continue
+                cluster = list(by_hash[h1])
+                visited.add(h1)
+                for j in range(i + 1, len(unique_hashes)):
+                    h2 = unique_hashes[j]
+                    if h2 in visited:
+                        continue
+                    if hamming_distance_hex(h1, h2) <= self.max_hamming_distance:
+                        cluster.extend(by_hash[h2])
+                        visited.add(h2)
+                if len(cluster) > 1:
+                    cluster.sort(key=lambda x: x[1], reverse=True)
+                    groups.append(cluster)
+
+        groups.sort(key=lambda g: len(g), reverse=True)
+        _safe_emit(self.signals.finished, groups)
+
+
+class DatasetExportSignals(QObject):
+    progress = pyqtSignal(int, int, str)
+    finished = pyqtSignal(int, str)
+
+
+class DatasetExportWorker(QRunnable):
+    """
+    Exports selected/filtered artworks alongside `.txt` caption files for Kohya_ss / LoRA / Colab training.
+    """
+    def __init__(self, file_paths, output_dir, db_file=DB_FILE,
+                 min_confidence=0.35, format_spaces=True, prefix_tags="",
+                 copy_images=True, include_ratings=False):
+        super().__init__()
+        self.file_paths = list(file_paths or [])
+        self.output_dir = output_dir
+        self.db_file = db_file
+        self.min_confidence = float(min_confidence)
+        self.format_spaces = bool(format_spaces)
+        self.prefix_tags = (prefix_tags or "").strip()
+        self.copy_images = bool(copy_images)
+        self.include_ratings = bool(include_ratings)
+        self.signals = DatasetExportSignals()
+        self.running = True
+
+    def stop(self):
+        self.running = False
+
+    @pyqtSlot()
+    def run(self):
+        os.makedirs(self.output_dir, exist_ok=True)
+        conn = get_thread_local_conn(self.db_file)
+        cursor = conn.cursor()
+
+        exported = 0
+        total = len(self.file_paths)
+        used_names = set()
+
+        for idx, src_path in enumerate(self.file_paths):
+            if not self.running:
+                break
+            if not os.path.exists(src_path):
+                continue
+
+            base_name = os.path.basename(src_path)
+            stem, ext = os.path.splitext(base_name)
+            candidate_stem = stem
+            counter = 1
+            while candidate_stem.lower() in used_names:
+                candidate_stem = f"{stem}_{counter}"
+                counter += 1
+            used_names.add(candidate_stem.lower())
+
+            try:
+                if self.copy_images:
+                    dst_img_path = os.path.join(self.output_dir, f"{candidate_stem}{ext}")
+                    shutil.copy2(src_path, dst_img_path)
+                    txt_path = os.path.join(self.output_dir, f"{candidate_stem}.txt")
+                else:
+                    txt_path = os.path.splitext(src_path)[0] + ".txt"
+
+                cursor.execute(
+                    "SELECT tag_name, category, confidence FROM file_tags WHERE path = ? ORDER BY category DESC, confidence DESC",
+                    (src_path,)
+                )
+                rows = cursor.fetchall()
+                tags_out = []
+                if self.prefix_tags:
+                    for pt in self.prefix_tags.split(","):
+                        if pt.strip():
+                            tags_out.append(pt.strip())
+
+                for tag_name, cat, conf in rows:
+                    if tag_name in ('__none__', 'favorite') or cat in (10, 99):
+                        continue
+                    if cat in (5, 9) and not self.include_ratings:
+                        continue
+                    if conf < self.min_confidence and cat not in (8, 11):
+                        continue
+                    formatted = tag_name.replace('_', ' ') if self.format_spaces else tag_name
+                    if formatted not in tags_out:
+                        tags_out.append(formatted)
+
+                with open(txt_path, "w", encoding="utf-8") as f:
+                    f.write(", ".join(tags_out))
+
+                exported += 1
+            except Exception as e:
+                logging.error(f"Error exporting dataset item {src_path}: {e}")
+
+            _safe_emit(self.signals.progress, idx + 1, total, base_name)
+
+        _safe_emit(self.signals.finished, exported, self.output_dir)

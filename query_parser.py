@@ -4,8 +4,9 @@ import shlex
 import sqlite3
 import logging
 
+
 class SearchQuery:
-    def __init__(self):
+    def __init__(self, rating=None, **kwargs):
         self.raw_text = ""
         self.keywords = []          # General words (filename or tag search)
         self.include_tags = []       # General tags to require (AND)
@@ -13,12 +14,17 @@ class SearchQuery:
         self.include_chars = []      # Characters to require
         self.exclude_chars = []      # Characters to exclude
         self.include_series = []     # Series/Copyright to require
-        self.include_artists = []    # Artist name / ID
-        self.rating = None           # 'ALL', 'SFW', 'NSFW', 'SENSITIVE', 'QUESTIONABLE', 'EXPLICIT'
+        self.include_artists = []    # Artist name / ID to require
+        self.exclude_artists = []    # Artist name / ID to exclude
+        self.only_favorites = False  # is:favorite / is:fav
+        self.rating = rating.upper() if isinstance(rating, str) else rating  # 'ALL', 'SFW', 'NSFW', 'SENSITIVE', 'QUESTIONABLE', 'EXPLICIT'
         self.min_size = None         # Bytes
         self.max_size = None         # Bytes
         self.file_types = set()      # e.g. {'jpg', 'png'}, {'gif'}, {'video'}, {'zip'}
         self.or_tag_groups = []      # List of lists of alternative tags: [[t1, t2], [t3, t4]]
+        for k, v in kwargs.items():
+            if hasattr(self, k):
+                setattr(self, k, v)
 
     def has_tag_or_rating_filter(self, active_rating=None, active_char=None):
         return (
@@ -27,24 +33,29 @@ class SearchQuery:
             bool(self.include_chars) or
             bool(self.exclude_chars) or
             bool(self.include_series) or
+            bool(self.include_artists) or
+            bool(self.exclude_artists) or
+            bool(self.only_favorites) or
             bool(self.or_tag_groups) or
             (self.rating is not None and self.rating != 'ALL') or
             (active_rating is not None and active_rating != 'ALL') or
             bool(active_char)
         )
 
+
 # Explicit NSFW tags for Danbooru classification
 NSFW_EXPLICIT_TAGS = (
-    'nude', 'nipples', 'pussy', 'penis', 'sex', 'fellatio', 'masturbation', 
-    'areola', 'cum', 'breasts_out', 'topless', 'bottomless', 'spread_legs', 
+    'nude', 'nipples', 'pussy', 'penis', 'sex', 'fellatio', 'masturbation',
+    'areola', 'cum', 'breasts_out', 'topless', 'bottomless', 'spread_legs',
     'explicit', 'nsfw', 'uncensored', 'dildo', 'penetration', 'paizuri',
     'anus', 'anal', 'fingering', 'lactation', 'cameltoe', 'erection'
 )
 
 SENSITIVE_ECCHI_TAGS = (
-    'sensitive', 'cleavage', 'bikini', 'swimsuit', 'panties', 'underwear', 
+    'sensitive', 'cleavage', 'bikini', 'swimsuit', 'panties', 'underwear',
     'lingerie', 'bra', 'sideboob', 'underboob', 'thong', 'ass', 'crotch'
 )
+
 
 def parse_size_str(s):
     s = s.strip().lower()
@@ -65,12 +76,14 @@ def parse_size_str(s):
     except Exception:
         return None
 
+
 def clean_tag_token(token):
     """Strips leading -, !, or tag: prefix and formats for DB matching."""
     t = token.lstrip('-!').strip()
     if t.lower().startswith(('tag:', 'char:', 'character:', 'series:', 'copyright:', 'artist:', 'author:')):
         t = t.split(':', 1)[1]
     return t.replace(' ', '_').lower()
+
 
 def parse_search_query(text):
     """
@@ -106,16 +119,28 @@ def parse_search_query(text):
             next_token = raw_tokens[i + 1].strip()
             clean_prev = clean_tag_token(prev_token)
             clean_next = clean_tag_token(next_token)
-            for lst in (query.keywords, query.include_tags, query.include_chars):
-                if clean_prev in lst: lst.remove(clean_prev)
+            for lst in (query.keywords, query.include_tags, query.include_chars, query.include_artists):
+                if clean_prev in lst:
+                    lst.remove(clean_prev)
             if prev_token.lower().startswith(('char:', 'character:')):
-                if clean_prev not in query.exclude_chars: query.exclude_chars.append(clean_prev)
+                if clean_prev not in query.exclude_chars:
+                    query.exclude_chars.append(clean_prev)
+            elif prev_token.lower().startswith(('artist:', 'author:')):
+                if clean_prev not in query.exclude_artists:
+                    query.exclude_artists.append(clean_prev)
             else:
-                if clean_prev not in query.exclude_tags: query.exclude_tags.append(clean_prev)
+                if clean_prev not in query.exclude_tags:
+                    query.exclude_tags.append(clean_prev)
+
             if next_token.lower().startswith(('char:', 'character:')):
-                if clean_next not in query.exclude_chars: query.exclude_chars.append(clean_next)
+                if clean_next not in query.exclude_chars:
+                    query.exclude_chars.append(clean_next)
+            elif next_token.lower().startswith(('artist:', 'author:')):
+                if clean_next not in query.exclude_artists:
+                    query.exclude_artists.append(clean_next)
             else:
-                if clean_next not in query.exclude_tags: query.exclude_tags.append(clean_next)
+                if clean_next not in query.exclude_tags:
+                    query.exclude_tags.append(clean_next)
             i += 2
             continue
 
@@ -126,7 +151,8 @@ def parse_search_query(text):
             clean_prev = clean_tag_token(prev_token)
             clean_next = clean_tag_token(next_token)
             for lst in (query.keywords, query.include_tags, query.include_chars):
-                if clean_prev in lst: lst.remove(clean_prev)
+                if clean_prev in lst:
+                    lst.remove(clean_prev)
             if query.or_tag_groups and clean_prev in query.or_tag_groups[-1]:
                 query.or_tag_groups[-1].append(clean_next)
             else:
@@ -149,30 +175,44 @@ def parse_search_query(text):
         if lower_token.startswith(('char:', 'character:')):
             val = clean_token.split(':', 1)[1].strip().replace(' ', '_').lower()
             if val:
-                if is_negated: query.exclude_chars.append(val)
-                else: query.include_chars.append(val)
+                if is_negated:
+                    query.exclude_chars.append(val)
+                else:
+                    query.include_chars.append(val)
 
         # 2. Series / Copyright
         elif lower_token.startswith(('series:', 'copyright:')):
             val = clean_token.split(':', 1)[1].strip().replace(' ', '_').lower()
-            if val: query.include_series.append(val)
+            if val:
+                query.include_series.append(val)
 
         # 3. Artist / Author
         elif lower_token.startswith(('artist:', 'author:')):
             val = clean_token.split(':', 1)[1].strip().replace(' ', '_').lower()
-            if val: query.include_artists.append(val)
+            if val:
+                if is_negated:
+                    query.exclude_artists.append(val)
+                else:
+                    query.include_artists.append(val)
 
         # 4. Tag
         elif lower_token.startswith('tag:'):
             val = clean_token.split(':', 1)[1].strip().replace(' ', '_').lower()
             if val:
-                if is_negated: query.exclude_tags.append(val)
-                else: query.include_tags.append(val)
+                if is_negated:
+                    query.exclude_tags.append(val)
+                else:
+                    query.include_tags.append(val)
 
-        # 5. Rating / Safety
+        # 5. Rating / Safety / Favorites
         elif lower_token.startswith(('rating:', 'is:', 'r:')):
             val = clean_token.split(':', 1)[1].strip().lower()
-            if val in ('sfw', 'safe', 'general'):
+            if val in ('fav', 'favorite', 'favorites', 'starred'):
+                if is_negated:
+                    query.exclude_tags.append('favorite')
+                else:
+                    query.only_favorites = True
+            elif val in ('sfw', 'safe', 'general'):
                 query.rating = 'NSFW' if is_negated else 'SFW'
             elif val in ('nsfw', 'r18', 'r-18', 'explicit'):
                 query.rating = 'SFW' if is_negated else 'NSFW'
@@ -186,10 +226,12 @@ def parse_search_query(text):
             val = clean_token.split(':', 1)[1].strip()
             if val.startswith(('>', '>=')):
                 sz = parse_size_str(val.lstrip('>='))
-                if sz: query.min_size = sz
+                if sz:
+                    query.min_size = sz
             elif val.startswith(('<', '<=')):
                 sz = parse_size_str(val.lstrip('<='))
-                if sz: query.max_size = sz
+                if sz:
+                    query.max_size = sz
 
         # 7. File Type
         elif lower_token.startswith(('type:', 'ext:')):
@@ -220,11 +262,72 @@ def parse_search_query(text):
     return query
 
 
+def _query_tag_paths_smart(cursor, tag_str: str) -> set:
+    """
+    Executes a fast B-Tree index seek (WHERE tag_name = ?) first.
+    Falls back to substring LIKE only when wildcard '*' is used or exact match yields 0 results.
+    Prevents short tags like 'bra' or 'ass' from matching 'umbrella' or 'glasses' while keeping index speed.
+    """
+    if '*' in tag_str:
+        like_pat = tag_str.replace('*', '%')
+        cursor.execute("SELECT DISTINCT path FROM file_tags WHERE tag_name LIKE ?", (like_pat,))
+        return {r[0] for r in cursor.fetchall()}
+
+    cursor.execute("SELECT DISTINCT path FROM file_tags WHERE tag_name = ?", (tag_str,))
+    exact_rows = {r[0] for r in cursor.fetchall()}
+    if exact_rows:
+        return exact_rows
+
+    cursor.execute("SELECT DISTINCT path FROM file_tags WHERE tag_name LIKE ?", (f"%{tag_str}%",))
+    return {r[0] for r in cursor.fetchall()}
+
+
+def _resolve_artist_paths(cursor, artist_term: str) -> set:
+    """
+    Resolves all file paths belonging to an artist by matching:
+    1. Artist name or artist_id in `artists` table -> matching `parent_folder` or `path` in `file_index`
+    2. Direct folder name / path match in `file_index`
+    3. Direct tag match in `file_tags`
+    """
+    clean_term = artist_term.replace('_', ' ').strip().lower()
+    raw_term = artist_term.strip().lower()
+    matched_aids = {raw_term}
+
+    try:
+        cursor.execute(
+            "SELECT artist_id FROM artists WHERE LOWER(name) LIKE ? OR LOWER(name) LIKE ? OR LOWER(artist_id) = ?",
+            (f"%{clean_term}%", f"%{raw_term}%", raw_term)
+        )
+        for (aid,) in cursor.fetchall():
+            if aid:
+                matched_aids.add(str(aid).strip())
+    except Exception:
+        pass
+
+    paths = set()
+    try:
+        for aid in matched_aids:
+            cursor.execute(
+                "SELECT path FROM file_index WHERE LOWER(parent_folder) LIKE ? OR LOWER(path) LIKE ?",
+                (f"%\\{aid.lower()}", f"%/{aid.lower()}/%")
+            )
+            paths.update(r[0] for r in cursor.fetchall())
+            cursor.execute(
+                "SELECT path FROM file_index WHERE LOWER(path) LIKE ?",
+                (f"%\\{aid.lower()}\\%",)
+            )
+            paths.update(r[0] for r in cursor.fetchall())
+    except Exception:
+        pass
+
+    return paths
+
+
 def resolve_matching_paths(conn, query, active_rating='ALL', active_char=None):
     """
-    Executes an optimized multi-tag and rating query against the SQLite database.
+    Executes an optimized multi-tag, artist, favorite, and rating query against the SQLite database.
     Returns:
-        set[str] of matching file paths, OR None if no tag/rating restrictions apply.
+        set[str] of matching file paths, OR None if no tag/rating/artist restrictions apply.
     """
     effective_rating = query.rating or active_rating or 'ALL'
     all_include_chars = list(query.include_chars)
@@ -237,6 +340,9 @@ def resolve_matching_paths(conn, query, active_rating='ALL', active_char=None):
         bool(all_include_chars) or
         bool(query.exclude_chars) or
         bool(query.include_series) or
+        bool(query.include_artists) or
+        bool(query.exclude_artists) or
+        bool(query.only_favorites) or
         bool(query.or_tag_groups) or
         (effective_rating and effective_rating != 'ALL')
     )
@@ -247,49 +353,66 @@ def resolve_matching_paths(conn, query, active_rating='ALL', active_char=None):
     cursor = conn.cursor()
     matched_paths = None
 
-    # 1. Require Characters (AND)
+    # 0. Require Favorites (is:favorite / is:fav)
+    if query.only_favorites:
+        try:
+            cursor.execute("SELECT DISTINCT path FROM file_tags WHERE category = 10 AND tag_name = 'favorite'")
+            fav_paths = {r[0] for r in cursor.fetchall()}
+            matched_paths = fav_paths if matched_paths is None else (matched_paths & fav_paths)
+        except Exception as e:
+            logging.error(f"Error querying favorites: {e}")
+
+    # 1. Require Artists (AND)
+    for art in query.include_artists:
+        try:
+            art_paths = _resolve_artist_paths(cursor, art)
+            matched_paths = art_paths if matched_paths is None else (matched_paths & art_paths)
+        except Exception as e:
+            logging.error(f"Error querying artist '{art}': {e}")
+
+    # 2. Require Characters (AND)
     for ch in all_include_chars:
         try:
-            cursor.execute("SELECT DISTINCT path FROM file_tags WHERE (category = 4 OR category = 0) AND (tag_name = ? OR tag_name LIKE ?)",
-                           (ch, f"%{ch}%"))
+            cursor.execute(
+                "SELECT DISTINCT path FROM file_tags WHERE (category = 4 OR category = 0 OR category = 11) AND (tag_name = ? OR tag_name LIKE ?)",
+                (ch, f"%{ch}%")
+            )
             paths = {r[0] for r in cursor.fetchall()}
             matched_paths = paths if matched_paths is None else (matched_paths & paths)
         except Exception as e:
             logging.error(f"Error querying character '{ch}': {e}")
 
-    # 2. Require Series (AND)
+    # 3. Require Series (AND)
     for sr in query.include_series:
         try:
-            cursor.execute("SELECT DISTINCT path FROM file_tags WHERE category = 3 AND (tag_name = ? OR tag_name LIKE ?)",
-                           (sr, f"%{sr}%"))
+            cursor.execute(
+                "SELECT DISTINCT path FROM file_tags WHERE category = 3 AND (tag_name = ? OR tag_name LIKE ?)",
+                (sr, f"%{sr}%")
+            )
             paths = {r[0] for r in cursor.fetchall()}
             matched_paths = paths if matched_paths is None else (matched_paths & paths)
         except Exception as e:
             logging.error(f"Error querying series '{sr}': {e}")
 
-    # 3. Require General Tags (AND)
+    # 4. Require General Tags (AND) - Uses fast index seek first
     for tg in query.include_tags:
         try:
-            cursor.execute("SELECT DISTINCT path FROM file_tags WHERE tag_name = ? OR tag_name LIKE ?",
-                           (tg, f"%{tg}%"))
-            paths = {r[0] for r in cursor.fetchall()}
+            paths = _query_tag_paths_smart(cursor, tg)
             matched_paths = paths if matched_paths is None else (matched_paths & paths)
         except Exception as e:
             logging.error(f"Error querying tag '{tg}': {e}")
 
-    # 4. OR Tag Groups
+    # 5. OR Tag Groups
     for or_group in query.or_tag_groups:
         try:
             group_paths = set()
             for t in or_group:
-                cursor.execute("SELECT DISTINCT path FROM file_tags WHERE tag_name = ? OR tag_name LIKE ?",
-                               (t, f"%{t}%"))
-                group_paths.update(r[0] for r in cursor.fetchall())
+                group_paths.update(_query_tag_paths_smart(cursor, t))
             matched_paths = group_paths if matched_paths is None else (matched_paths & group_paths)
         except Exception as e:
             logging.error(f"Error querying OR group {or_group}: {e}")
 
-    # 5. Rating / Safety Filter
+    # 6. Rating / Safety Filter
     if effective_rating and effective_rating != 'ALL':
         try:
             if effective_rating == 'SFW':
@@ -306,7 +429,7 @@ def resolve_matching_paths(conn, query, active_rating='ALL', active_char=None):
                     matched_paths = matched_paths - nsfw_set
                 else:
                     # Get all scanned paths minus NSFW
-                    cursor.execute("SELECT DISTINCT path FROM file_tags")
+                    cursor.execute("SELECT DISTINCT path FROM file_tags WHERE category != 10")
                     all_scanned = {r[0] for r in cursor.fetchall()}
                     matched_paths = all_scanned - nsfw_set
 
@@ -341,7 +464,7 @@ def resolve_matching_paths(conn, query, active_rating='ALL', active_char=None):
         except Exception as e:
             logging.error(f"Error applying rating filter '{effective_rating}': {e}")
 
-    # 6. Exclude Tags & Characters (NOT / Negation / NOR)
+    # 7. Exclude Tags & Characters (NOT / Negation / NOR)
     all_excludes = set(query.exclude_tags) | set(query.exclude_chars)
     if all_excludes:
         try:
@@ -351,10 +474,25 @@ def resolve_matching_paths(conn, query, active_rating='ALL', active_char=None):
             if matched_paths is not None:
                 matched_paths = matched_paths - excluded_paths
             else:
-                cursor.execute("SELECT DISTINCT path FROM file_tags")
+                cursor.execute("SELECT DISTINCT path FROM file_tags WHERE category != 10")
                 all_scanned = {r[0] for r in cursor.fetchall()}
                 matched_paths = all_scanned - excluded_paths
         except Exception as e:
             logging.error(f"Error excluding tags: {e}")
+
+    # 8. Exclude Artists
+    if query.exclude_artists:
+        try:
+            excluded_art_paths = set()
+            for art in query.exclude_artists:
+                excluded_art_paths.update(_resolve_artist_paths(cursor, art))
+            if matched_paths is not None:
+                matched_paths = matched_paths - excluded_art_paths
+            else:
+                cursor.execute("SELECT path FROM file_index")
+                all_indexed = {r[0] for r in cursor.fetchall()}
+                matched_paths = all_indexed - excluded_art_paths
+        except Exception as e:
+            logging.error(f"Error excluding artists: {e}")
 
     return matched_paths if matched_paths is not None else set()

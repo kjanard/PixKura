@@ -7,9 +7,11 @@ import numpy as np
 from PIL import Image
 
 # Ensure workspace root is in sys.path
-WORKSPACE_DIR = os.path.dirname(os.path.abspath(__file__))
+WORKSPACE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if WORKSPACE_DIR not in sys.path:
     sys.path.insert(0, WORKSPACE_DIR)
+
+ICON_JPG = os.path.join(WORKSPACE_DIR, "icon.jpg")
 
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt
@@ -69,10 +71,10 @@ class TestWD14Tagger(unittest.TestCase):
         self.assertEqual(arr_l.shape, (1, 448, 448, 3))
 
     def test_05_predict_real_image(self):
-        if not os.path.exists("icon.jpg"):
+        if not os.path.exists(ICON_JPG):
             self.skipTest("icon.jpg not found for real inference test")
 
-        res = self.tagger.predict("icon.jpg", char_threshold=0.30, gen_threshold=0.30)
+        res = self.tagger.predict(ICON_JPG, char_threshold=0.30, gen_threshold=0.30)
         self.assertIsNotNone(res)
         self.assertIn("characters", res)
         self.assertIn("series", res)
@@ -80,10 +82,10 @@ class TestWD14Tagger(unittest.TestCase):
         self.assertIn("rating", res)
 
     def test_06_decoupled_tensor_pipeline(self):
-        if not os.path.exists("icon.jpg"):
+        if not os.path.exists(ICON_JPG):
             self.skipTest("icon.jpg not found for real inference test")
 
-        tensor = self.tagger.prepare_media_tensor("icon.jpg")
+        tensor = self.tagger.prepare_media_tensor(ICON_JPG)
         self.assertIsNotNone(tensor)
         self.assertEqual(tensor.shape, (1, 448, 448, 3))
         self.assertEqual(tensor.dtype, np.float32)
@@ -92,8 +94,6 @@ class TestWD14Tagger(unittest.TestCase):
         self.assertIsNotNone(res)
         self.assertIn("all_tags", res)
         self.assertGreater(len(res["all_tags"]), 0)
-
-        self.assertIn("all_tags", res)
         self.assertIsInstance(res["general"], list)
         self.assertGreater(len(res["general"]), 0, "Should detect at least 1 general tag for icon.jpg")
 
@@ -102,14 +102,14 @@ class TestWD14Tagger(unittest.TestCase):
         self.assertIsNone(res, "Predicting non-existent file should return None gracefully")
 
     def test_08_fp16_model_inference(self):
-        if not os.path.exists("icon.jpg"):
+        if not os.path.exists(ICON_JPG):
             self.skipTest("icon.jpg not found for real inference test")
         
         tagger_fp16 = WD14Tagger(use_gpu=True, use_fp16=True)
         tagger_fp16.load_model()
         self.assertTrue(tagger_fp16.use_fp16)
         
-        tensor = tagger_fp16.prepare_media_tensor("icon.jpg")
+        tensor = tagger_fp16.prepare_media_tensor(ICON_JPG)
         self.assertIsNotNone(tensor)
         self.assertEqual(tensor.dtype, np.float16)
 
@@ -219,11 +219,11 @@ class TestAiTaggingWorker(unittest.TestCase):
         self.temp_db_fd, self.temp_db_path = tempfile.mkstemp(suffix=".db")
         self.db_setup = DatabaseSetup(self.temp_db_path)
 
-        # Seed file_index with icon.jpg
+        # Seed file_index with ICON_JPG
         conn = sqlite3.connect(self.temp_db_path)
         cur = conn.cursor()
         cur.execute("INSERT INTO file_index (path, filename, parent_folder, mtime, size) VALUES (?, ?, ?, ?, ?)",
-                    (os.path.abspath("icon.jpg"), "icon.jpg", "", 1000.0, 1024))
+                    (ICON_JPG, "icon.jpg", WORKSPACE_DIR, 1000.0, 1024))
         conn.commit()
         conn.close()
 
@@ -235,7 +235,7 @@ class TestAiTaggingWorker(unittest.TestCase):
 
     def test_worker_tagging_execution(self):
         worker = AiTaggingWorker(
-            root_path=os.path.abspath("."),  # Disk walk from current dir to find icon.jpg
+            root_path=None,  # Uses seeded file_index in self.temp_db_path directly
             db_file=self.temp_db_path,
             use_gpu=True,
             char_threshold=0.30,
@@ -257,7 +257,7 @@ class TestAiTaggingWorker(unittest.TestCase):
         self.assertGreaterEqual(finished_results[0][0], 1, "Should have tagged at least 1 file")
 
         # Verify tags were written to temp DB
-        tags = get_file_tags(self.temp_db_path, os.path.abspath("icon.jpg"))
+        tags = get_file_tags(self.temp_db_path, ICON_JPG)
         self.assertGreater(len(tags["all"]), 0, "Tags should be saved in SQLite database")
 
     def test_worker_pause_resume_stop(self):
@@ -349,6 +349,7 @@ class TestAiTagDialogUI(unittest.TestCase):
         self.assertIsNotNone(dialog.btn_stop)
         self.assertIsNotNone(dialog.combo_provider)
         self.assertIsNotNone(dialog.combo_scan_mode)
+        self.assertIsNotNone(dialog.combo_batch)
         self.assertEqual(dialog.combo_scan_mode.itemData(0), False) # Default is Quick Mode (rescan=False)
         self.assertEqual(dialog.combo_scan_mode.itemData(1), True)  # Full Re-scan (rescan=True)
         self.assertIsNotNone(dialog.slider_thresh)
@@ -363,6 +364,9 @@ class TestMainWindowAIIntegration(unittest.TestCase):
     def test_main_window_has_ai_tagger(self):
         window = PixivManagerApp()
         self.assertTrue(hasattr(window, 'btn_ai_tag'), "PixivManagerApp should have btn_ai_tag")
+        self.assertTrue(hasattr(window, 'btn_favorites'), "PixivManagerApp should have btn_favorites")
+        self.assertTrue(hasattr(window, 'btn_duplicates'), "PixivManagerApp should have btn_duplicates")
+        self.assertTrue(hasattr(window, 'btn_export_dataset'), "PixivManagerApp should have btn_export_dataset")
         self.assertTrue(hasattr(window, 'char_filter'), "PixivManagerApp should have char_filter dropdown")
         self.assertTrue(hasattr(window, 'search_completer'), "PixivManagerApp should have search_completer")
         self.assertEqual(window.char_filter.itemText(0), "All Characters")

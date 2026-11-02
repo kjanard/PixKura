@@ -3,6 +3,11 @@ import sys
 import os
 from PyQt6.QtWidgets import QApplication
 
+# Ensure workspace root is in sys.path
+WORKSPACE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if WORKSPACE_DIR not in sys.path:
+    sys.path.insert(0, WORKSPACE_DIR)
+
 app = QApplication.instance() or QApplication(sys.argv)
 
 from config import DB_FILE
@@ -36,7 +41,7 @@ class TestUIDialogs(unittest.TestCase):
         self.assertEqual(applied, ["rating:sfw"])
 
     def test_lightbox_viewer_initialization(self):
-        icon_path = os.path.join(os.path.dirname(__file__), "icon.ico")
+        icon_path = os.path.join(WORKSPACE_DIR, "icon.ico")
         paths = [icon_path] if os.path.exists(icon_path) else []
         dlg = LightboxViewerDialog(paths, current_index=0)
         self.assertIsNotNone(dlg)
@@ -283,7 +288,7 @@ class TestUIDialogs(unittest.TestCase):
             shutil.rmtree(temp_dir, ignore_errors=True)
 
     def test_minimizable_dialog_flags_and_sync(self):
-        from components import MinimizableDialog, SearchHelpDialog
+        from components import MinimizableDialog, SearchHelpDialog, DatasetExporterDialog, DuplicateFinderDialog
         from download_dialog import PixivDownloadDialog
         from ai_tag_dialog import AiTagDialog
         from dashboard_dialog import DashboardDialog
@@ -300,6 +305,7 @@ class TestUIDialogs(unittest.TestCase):
             AiTagDialog(parent),
             DashboardDialog(parent),
             LightboxViewerDialog([], 0, parent),
+            DuplicateFinderDialog(parent),
         ]
 
         for dlg in dialogs:
@@ -320,7 +326,121 @@ class TestUIDialogs(unittest.TestCase):
         self.assertFalse(parent.isMinimized())
         test_dlg.accept()
 
+    def test_ugoira_mp4_conversion_and_unicode_path(self):
+        import tempfile
+        import shutil
+        from PIL import Image
+        from workers import convert_frames_to_mp4
+
+        temp_dir = tempfile.mkdtemp()
+        try:
+            # Odd dimensions (101x99) to verify even-dimension padding for H.264/mp4v
+            f1 = Image.new("RGB", (101, 99), (255, 0, 0))
+            f2 = Image.new("RGB", (101, 99), (0, 255, 0))
+            f3 = Image.new("RGB", (101, 99), (0, 0, 255))
+            mp4_out = os.path.join(temp_dir, "76691698_p0 - うごイラ_test.mp4")
+
+            ok = convert_frames_to_mp4([f1, f2, f3], [60, 120, 80], mp4_out)
+            self.assertTrue(ok, "convert_frames_to_mp4 should succeed with OpenCV installed")
+            self.assertTrue(os.path.exists(mp4_out))
+            self.assertGreater(os.path.getsize(mp4_out), 256)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_opencv_wd14_rgba_white_background_compositing(self):
+        import tempfile
+        import numpy as np
+        from PIL import Image
+        from workers import decode_image_cv2_for_wd14
+
+        fd, tmp_png = tempfile.mkstemp(suffix=".png")
+        os.close(fd)
+        try:
+            # Fully transparent black RGBA image (0, 0, 0, 0)
+            img = Image.new("RGBA", (200, 200), (0, 0, 0, 0))
+            img.save(tmp_png, "PNG")
+
+            tensor = decode_image_cv2_for_wd14(tmp_png, target_size=448, target_dtype=np.float32, nchw=False)
+            self.assertIsNotNone(tensor)
+            self.assertEqual(tensor.shape, (1, 448, 448, 3))
+            # Because transparent pixels are composited onto white (255, 255, 255), mean value must be ~255.0 (not 0.0!)
+            self.assertGreater(float(tensor.mean()), 250.0)
+        finally:
+            if os.path.exists(tmp_png):
+                try: os.remove(tmp_png)
+                except Exception: pass
+
+    def test_dhash_and_dataset_exporter(self):
+        import tempfile
+        import shutil
+        import sqlite3
+        from PIL import Image, ImageDraw
+        from utils import compute_dhash, hamming_distance_hex
+        from database import DatabaseSetup
+        from workers import DatasetExportWorker
+        from components import DatasetExporterDialog, DuplicateFinderDialog
+
+        temp_dir = tempfile.mkdtemp()
+        try:
+            img1_path = os.path.join(temp_dir, "art1.png")
+            img2_path = os.path.join(temp_dir, "art1_copy.png")
+            im = Image.new("RGB", (128, 128), "white")
+            draw = ImageDraw.Draw(im)
+            draw.rectangle([10, 10, 80, 100], fill="black")
+            im.save(img1_path)
+            im.save(img2_path)
+
+            h1 = compute_dhash(img1_path)
+            h2 = compute_dhash(img2_path)
+            self.assertIsNotNone(h1)
+            self.assertEqual(h1, h2)
+            self.assertEqual(hamming_distance_hex(h1, h2), 0)
+
+            # Test DatasetExportWorker
+            db_path = os.path.join(temp_dir, "test_export.db")
+            DatabaseSetup(db_path)
+            conn = sqlite3.connect(db_path)
+            cur = conn.cursor()
+            cur.execute("INSERT INTO file_index (path, filename, parent_folder, mtime, size) VALUES (?, ?, ?, ?, ?)",
+                        (img1_path, "art1.png", temp_dir, 100.0, 1024))
+            cur.execute("INSERT INTO file_tags (path, tag_name, category, confidence) VALUES (?, ?, ?, ?)",
+                        (img1_path, "hatsune_miku", 4, 0.99))
+            cur.execute("INSERT INTO file_tags (path, tag_name, category, confidence) VALUES (?, ?, ?, ?)",
+                        (img1_path, "solo", 0, 0.95))
+            conn.commit()
+            conn.close()
+
+            export_dir = os.path.join(temp_dir, "lora_out")
+            worker = DatasetExportWorker(
+                file_paths=[img1_path],
+                output_dir=export_dir,
+                db_file=db_path,
+                prefix_tags="miku_lora, masterpiece"
+            )
+            finished_counts = []
+            worker.signals.finished.connect(lambda exp, dest: finished_counts.append((exp, dest)))
+            worker.run()
+
+            self.assertEqual(len(finished_counts), 1)
+            self.assertEqual(finished_counts[0][0], 1)
+            txt_path = os.path.join(export_dir, "art1.txt")
+            self.assertTrue(os.path.exists(txt_path))
+            with open(txt_path, "r", encoding="utf-8") as f:
+                caption = f.read()
+            self.assertIn("miku_lora", caption)
+            self.assertIn("hatsune miku", caption)
+
+            # Verify dialog instantiation
+            dlg_exp = DatasetExporterDialog(file_paths=[img1_path], db_file=db_path)
+            self.assertIsNotNone(dlg_exp)
+            dlg_exp.close()
+
+            dlg_dup = DuplicateFinderDialog(db_file=db_path)
+            self.assertIsNotNone(dlg_dup)
+            dlg_dup.close()
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
 if __name__ == "__main__":
     unittest.main()
-
 

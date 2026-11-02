@@ -4,6 +4,53 @@ All notable changes to the PixKura project will be documented in this file.
 
 ---
 
+## [Version 2.4.0-V.32] - 2026-11-02
+
+### Added (Security Hardening, Native `.mp4` Ugoira, Favorites, Duplicate Finder & Dataset Exporter)
+* **Native `.mp4` Ugoira Video Conversion (`workers.py`)**:
+  * Upgraded `PixivDownloaderWorker.process_ugoira` (and pre-emptive skip checks across `ILLUST`, `ARTIST`, and `BOOKMARK` modes) to compile downloaded Pixiv Ugoira ZIP frames and variable per-frame delays directly into high-efficiency `.mp4` video files via OpenCV (`convert_frames_to_mp4`).
+  * Eliminates 256-color GIF quantization artifacts, preserves full 24-bit color fidelity, reduces output file sizes by 70–85%, supports Unicode destination paths on Windows via temporary staging, and automatically pads odd dimensions `(w + w % 2, h + h % 2)` for H.264/MPEG-4 hardware decoder compatibility (with automatic fallback to `.gif` if OpenCV is unavailable).
+* **Security & Privacy Hardening (`config.py`, `utils.py`, `tagger.py`, `lightbox_viewer.py`, `ai_tag_dialog.py`, `main.py`)**:
+  * **Windows DPAPI Credential Encryption**: Implemented `encrypt_secret()` and `decrypt_secret()` in `config.py` using native Windows `CryptProtectData` / `CryptUnprotectData` (`crypt32.dll`). Sensitive credentials (`pixiv_cookie` and `danbooru_api_key`) are now automatically encrypted at rest in `config.json`.
+  * **Thread-Safe Atomic Configuration (`load_app_config`, `update_app_config`)**: All reads and writes to `config.json` are now synchronized with a re-entrant lock and written atomically via `.tmp` + `os.replace`, preventing lost settings or JSON corruption during concurrent UI/worker updates.
+  * **Ugoira Zip Bomb & Memory Exhaustion Shield**: Enforced `MAX_UGOIRA_FRAME_BYTES` (35 MB/frame), `MAX_UGOIRA_TOTAL_BYTES` (350 MB/archive), and `MAX_UGOIRA_FRAMES` (2,000 frames) across `PixivDownloaderWorker`, `LightboxViewerDialog.load_ugoira_frames`, and `utils.load_media_thumbnail`.
+  * **HTML Injection Protection (`html.escape`)**: Escaped untrusted filenames, artist names, and tag names before rendering in `QLabel` and `QTextEdit` across `main.py`, `lightbox_viewer.py`, and `ai_tag_dialog.py`.
+  * **Model Download Size Verification**: Added strict `downloaded == total_size` verification in `WD14Tagger.download_models()` before renaming `.download` temporary files to prevent corrupted ONNX model loads on dropped connections.
+* **⭐ Favorites & Custom Manual Tagging System (`database.py`, `lightbox_viewer.py`, `main.py`, `query_parser.py`)**:
+  * Added `toggle_file_favorite()`, `is_file_favorite()`, `add_custom_file_tag()`, and `remove_file_tag()` in `database.py` (using `category = 2` for custom tags and `__favorite__` marker, preserved across AI Tagger Full Re-scans).
+  * Added `⭐ Favorite` toggle button (shortcut `S`) and custom tag input box (`+ tag_name`) in `LightboxViewerDialog`, plus right-click context menu favorite toggling in gallery views and a top toolbar `⭐ Favorites` quick filter button.
+  * Added `is:fav` / `is:favorite` support in `query_parser.py` and `StreamScanner`.
+* **🔍 Duplicate & Similar Artwork Finder (`utils.py`, `workers.py`, `components.py`, `dashboard_dialog.py`, `main.py`)**:
+  * Added 64-bit Difference Perceptual Hash (`compute_dhash`, `hamming_distance_hex`) in `utils.py` and `dhash` column migration on `file_index` in `database.py`.
+  * Added `DuplicateScannerWorker` and `DuplicateFinderDialog` to scan the library for exact and near-duplicate artworks (configurable Hamming distance threshold `0–10`) with one-click filter preview in the main gallery.
+* **📦 One-Click LoRA / Kohya_ss Dataset Exporter (`workers.py`, `components.py`, `dashboard_dialog.py`, `main.py`)**:
+  * Added `DatasetExportWorker` and `DatasetExporterDialog` to export any search query (e.g. `char:hatsune_miku rating:sfw`) into a destination directory with copied images and matching `.txt` caption files (`activation_prefix, character_tags, series_tags, general_tags`) and optional Strict SFW safety filtering.
+* **⚡ AI Hardware Accelerator Expansion & Dynamic Batch Selector (`tagger.py`, `ai_tag_dialog.py`, `workers.py`, `utils.py`)**:
+  * Added `OpenVINOExecutionProvider` and `QNNExecutionProvider` detection alongside `DmlExecutionProvider` and `CUDAExecutionProvider` in `WD14Tagger`, plus NPU hardware detection in `utils.detect_ai_accelerators()`.
+  * Added configurable Batch Size selector (`Batch = 4 / 8 / 16 / 32`) in `AiTagDialog` to scale from 2 GB integrated GPUs to 24 GB flagship GPUs.
+
+### Fixed & Optimized
+* **OpenCV Alpha Channel Black-Background Bug in AI Tagger (`workers.py`)**:
+  * Fixed critical accuracy bug in `AiTaggingWorker` where `cv2.imdecode(..., cv2.IMREAD_COLOR)` stripped the alpha channel of transparent PNGs and turned transparent regions pitch black `(0, 0, 0)` instead of white `(255, 255, 255)`, causing WD14/WDv3 models to mispredict `black_background` / `dark` tags and miss character features. Implemented `decode_image_cv2_for_wd14()` using `IMREAD_UNCHANGED` with fast vectorized white-background alpha compositing, 2D grayscale handling, and dynamic `input_dtype`/`input_shape` support.
+* **Qt Deleted C++ Object `RuntimeError` Crash Fix (`utils.py`, `workers.py`, `main.py`, `lightbox_viewer.py`)**:
+  * Eliminated `RuntimeError: wrapped C/C++ object of type QPushButton / WorkerSignals has been deleted` (logged in `error.log`) by introducing `safe_single_shot()` in `utils.py` and `_safe_emit()` in `workers.py`.
+* **`artist:` Search Query Resolution & B-Tree Index Optimization (`query_parser.py`, `workers.py`)**:
+  * Fixed bug where `artist:name` tokens were parsed into `SearchQuery` but never resolved against the `artists` table or `file_index`. Implemented `_resolve_artist_paths()` in `query_parser.py` and `StreamScanner`.
+  * Optimized `_query_tag_paths_smart()` in `query_parser.py` to perform an O(log N) exact B-Tree index seek (`WHERE tag_name = ?`) on `idx_tag_name` first before falling back to `LIKE` substring matching, dramatically accelerating multi-tag queries on 7.7M+ tag rows.
+* **Orphaned Database Rows & >100% Dashboard Coverage Fix (`database.py`, `workers.py`)**:
+  * Added `cleanup_orphaned_records()` to purge orphaned rows in `file_tags` and `file_thumbnails` when files/folders are deleted during `FolderCacheScanner` Quick Sync or `DatabaseOptimizerWorker` (`VACUUM`).
+  * Bounded `tagged_files` and `nsfw_count` in `get_dashboard_analytics()` against active `file_index` paths so AI Tagged coverage never exceeds 100%.
+* **Detail View (`page_detail`) Viewport Lazy Loading & LRU Cache (`main.py`)**:
+  * Replaced eager full-directory thumbnail loading in `load_detail_images()` with viewport-based lazy loading (`load_visible_detail_thumbnails`, `detail_scroll_timer`) and a bounded `detail_icon_cache` (`MAX_DETAIL_CACHE = 300`), preventing UI freezes when opening artist folders containing 1,000+ illustrations.
+* **Clean SQLite WAL Shutdown & Console Stderr Preservation (`workers.py`, `main.py`)**:
+  * Added `close_all_thread_local_conns()` to track and close all worker thread-local SQLite connections prior to `PRAGMA wal_checkpoint(TRUNCATE)` on shutdown and `VACUUM`.
+  * Made C-level `stderr` redirection conditional on running `main.py` directly without `--console`/`--debug`, preserving console output during CLI debugging and `unittest` execution.
+* **Test Suite Reorganization & Bootstrapper Upgrade (`tests/`, `run.bat`, `requirements.txt`)**:
+  * Relocated all automated unit tests and test media (`test_ai_tagger.py`, `test_query_parser.py`, `test_ui_dialogs.py`, `test_video.mp4`) into a dedicated `tests/` directory (`42/42` tests passing).
+  * Upgraded `run.bat` with UTF-8 codepage (`chcp 65001`), `.venv`/`venv` awareness in `--console` mode, and a new `run.bat --test` (`-t`) command to execute the entire unit test suite.
+
+---
+
 ## [Version 2.3.4-V.31.2] - 2026-10-09
 
 ### Added & Improved (Danbooru API Engine & Artist Resolver Overhaul)
@@ -161,139 +208,19 @@ All notable changes to the PixKura project will be documented in this file.
   * Added `test_query_parser.py`: Unit tests for boolean parsing, prefixes, and zero-overlap SFW/NSFW database queries.
   * Added `test_ui_dialogs.py`: Unit tests for Dashboard analytics calculation, Lightbox viewer, and Search Help dialogs. (Total 28/28 tests passing).
 
-### Changed
-* **WD14 ConvNeXt V2 Upgrade**: Updated AI tagger to ConvNeXt V2 with FP16 half-precision, using `op_block_list=['ReduceSumSquare', 'Sqrt', 'Div', 'ReduceMean', 'GlobalAveragePool']` to eliminate GRN layer FP16 overflow/NaNs.
-* **Danbooru API Integration**: Added Danbooru as Source 2 in `BooruNameUpdateWorker` with custom User-Agent `PixivManager/2.2.0` (avoiding Cloudflare 403 blocks), with Safebooru as fallback.
-* **Requirements Modernization (`requirements.txt`)**: Reorganized into logical categories with Windows DirectML environment markers (`sys_platform == 'win32'`) and Python 3.12 compatible version baselines.
-* **Bootstrapper Upgrade (`run.bat`)**: Added virtual environment (`.venv`/`venv`) auto-detection, standard `start ""` syntax, Windows `pyw` launcher support, dynamic `Python3*` search, and `--console` / `--debug` mode.
-
-### Fixed
-* **Cover Collage Randomize [X] Bug**: Fixed issue where closing the randomize dialog via `[X]` or `Esc` returned `None`, triggering an unintended Full Rebuild of all covers.
-* **4-File Cover Randomization**: Fixed `composite()` in `workers.py` to shuffle and regenerate collage covers even when `len(files) <= 4`.
-* **Rating Tag Category Recognition**: Fixed `tagger.py` line 312 to recognize category 9 tags (`general`, `sensitive`, `questionable`, `explicit`) from SmilingWolf CSV metadata.
-* **Missing Logging Import**: Added missing `import logging` in `database.py`.
-* **Missing QApplication Import**: Added missing `QApplication` import in `components.py`.
-
 ---
 
 ## [Version 2.2.0-V.28] - 2026-08-23
-
-### Added
-* **AI Character & Tag Classifier (Local DirectML GPU Engine)**: Integrated local anime vision AI tagger supporting WD14 Tagger (v1.4) and the new WD Tagger v3 Series (ConvNeXt, ViT, SwinV2) by SmilingWolf.
-  * **Multi-Model Registry & One-Click Downloader**: Built-in multi-model selector in the AI Tag Dialog supporting `WD14 ConvNeXt v2`, `WD Tagger v3 ConvNeXt` (~10,000+ tags), `WD Tagger v3 ViT`, `WD Tagger v3 SwinV2`, and `👑 WD Tagger v3 Ensemble (3-in-1)` with live download progress tracking.
-  * **Ultra-Accurate 3-in-1 Ensemble Engine**: Added Soft-Voting Probability Averaging (`probs = mean(p1, p2, p3)`) combining ConvNeXt, ViT, and SwinV2 architectures simultaneously in GPU VRAM to filter out false-positive noise and maximize character identification precision.
-  * **DirectML GPU Acceleration**: Native DirectX 12 acceleration on Windows supporting AMD Radeon (RDNA/RDNA2/RDNA3), NVIDIA GeForce RTX/GTX, and Intel Arc GPUs without CUDA lock-in.
-  * **FP16 Half-Precision Optimization**: Automated conversion of ONNX models to FP16 half-precision, leveraging AMD RDNA2 Rapid Packed Math (RPM) for 2x mathematical throughput and 50% model size reduction (~185 MB).
-  * **Dynamic Batched GPU Inference (Batch=16)**: Patched ONNX model graphs for dynamic batch dimensions, stacking 16 image tensors per single GPU kernel launch to boost raw inference throughput from 32 FPS to ~200–290 FPS.
-  * **C++ OpenCV Image Preprocessing**: Integrated `cv2.imdecode` (via `np.fromfile` for 100% Unicode path support on Windows) to release Python's GIL during image decoding, providing up to 1,500+ FPS supply rate across 16 threads.
-  * **Adaptive Storage Profiles & Auto-Detect (HDD vs SSD)**: Automatic physical drive hardware detection (`Get-Partition` + `Get-PhysicalDisk`); automatically applies directory-based file sorting (`sort by dirname`) and limits I/O concurrency to 3–4 threads on spinning HDDs to eliminate mechanical head thrashing, while scaling to 16 threads on NVMe/SATA SSDs.
-  * **Real-time Stopwatch & Performance Metrics**: Added live running stopwatch timer (`⏱️ ใช้ไป: mm:ss`), auto-freezing upon completion, paired with monotonically stable real-time average FPS and accurate ETA remaining countdown.
-  * **Quick Mode vs Full Re-scan Selector**: Prominent scan mode selector in AI Tag Dialog defaulting to **Quick Mode** (scans only untagged files, automatically skipping files that already have tags in SQLite) alongside **Full Re-scan** mode for refreshing existing tags with new models.
-  * **Full Test Suite (`test_ai_tagger.py`)**: 20 comprehensive unit tests covering ONNX providers, model conversions, dynamic batching, ensemble soft voting, database indexing, and thread workers.
-
-### Changed
-* **SQLite Tagging Schema**: Created `file_tags` table with composite indexes (`idx_file_tags_path_cat`, `idx_file_tags_name`) for instant multi-tag lookup and aggregate statistics (`get_tag_stats`).
-* **C-Level Warning Suppression**: Configured `OPENCV_LOG_LEVEL = OFF`, comprehensive `QT_LOGGING_RULES` (font, imageio, icc), and C-runtime stderr redirection in `main.py` to completely silence benign `libpng warning: iCCP/eXIf` console noise while preserving full Python exception logging in `error.log`.
-
----
+* Integrated local anime vision AI tagger supporting WD14 Tagger (v1.4) and WD Tagger v3 Series (ConvNeXt, ViT, SwinV2) by SmilingWolf with DirectML GPU, FP16, and Batch=16 inference.
 
 ## [Version 2.1.0-V.27] - 2026-08-17
-
-### Added
-* **Smooth Lookahead Overscan Buffer**: Implemented proactive viewport lookahead that pre-renders 50 items behind and 120 items ahead in Folder View (30 behind and 80 ahead in File View), completely eliminating gray placeholder flashes during scrolling.
-* **Bounded LRU Cache Architecture**: Integrated dual `OrderedDict` Least-Recently-Used caches (`MAX_FOLDER_CACHE = 600` and `MAX_FILE_CACHE = 400`) to maintain 0ms instant rendering when scrolling back and forth while strictly capping RAM usage at ~300–450 MB.
-* **Window Resize & State Change UI Event Triggers**: Added `resizeEvent` and `changeEvent (WindowStateChange)` handlers in `PixivManagerApp` to automatically recalculate and decode visible thumbnails whenever the window is resized, maximized, or restored.
-* **Instant Sort Re-Rendering**: Added immediate post-sort buffer re-triggers in `apply_sort()` to decode newly positioned items instantly upon changing sort modes (Name, Date, File Size, File Count, Random).
-
-### Changed
-* **Viewport-Based Icon Management (92% RAM Reduction)**: Replaced full-memory `QIcon`/`QPixmap` instantiation for all 15,744+ folders with in-memory compressed raw JPEG byte storage (~10 KB per folder), slashing application RAM consumption from **3,775 MB to ~303 MB**.
-* **Ultra-Low Debounce Timers**: Decreased scrolling debounce latency from 100ms to 15–25ms across folder and file views for near real-time rendering.
-* **SQLite Memory & Thread Pool Tuning**: Adjusted global SQLite PRAGMA tuning (`mmap_size` from 2 GB to 128 MB and `cache_size` from 20 MB to 4 MB per connection). Capped `bg_pool` at max 6 threads, `fg_pool` at max 4 threads, and `BackgroundThumbnailPreloader` at max 3 threads to prevent thread-local connection overhead.
-* **Immediate Memory Release**: Configured `all_scanned_files` to explicitly clear memory immediately after UI model construction.
-
-### Fixed
-* **Back Navigation Placeholder Freeze**: Fixed a bug in `go_back()` where returning to the Files view (`page_files`) did not trigger the file viewport timer, leaving thumbnails as gray placeholders until the user scrolled.
-* **Stream Scanner Latency**: Reduced post-scan UI trigger delay in `handle_stream_finished` from 100ms to 25ms for faster file search results.
-* **Real-time Cover Randomization Update**: Fixed an issue in `handle_folder_updated` where newly randomized folder covers were not immediately rendered on-screen if not yet registered in active cache.
-* **Live Avatar Overlay on Name Updates**: Fixed an issue in `handle_api_update` to ensure newly fetched Pixiv/Booru profile avatars are composited and updated on visible grid items in real-time.
-
----
+* Implemented Viewport-Based Icon Management (92% RAM reduction), Smooth Lookahead Overscan Buffer, and Bounded LRU Caches.
 
 ## [Version 2.0.0-V.26] - 2026-07-09
-
-### Added
-* **MVC Architecture for UI**: Replaced rigid `QListWidget` grids with a high-performance `QListView` and `ThumbnailListModel` data architecture, significantly boosting rendering speed and eliminating UI freezes on large datasets.
-* **Dedicated Download Dialog**: Extracted the "Pixiv Download Manager" into a standalone `download_dialog.py` to decouple UI components and improve code organization.
-* **Corrupt Image Error Indicator**: Implemented a visual "ERR" badge placeholder for corrupted or 0-byte images instead of rendering blank dark boxes.
-* **Truncated Image Recovery**: Enabled Pillow's `LOAD_TRUNCATED_IMAGES` to salvage and display partially downloaded image files.
-
-### Changed
-* **SQLite Concurrency Optimization**: Replaced shared SQLite connections with thread-local pooling (`threading.local()`) and injected database rollback mechanisms in `workers.py`, eliminating WAL mode database lockups.
-* **Instant Sorting Engine**: Rewrote sorting logic (Size, Date, Natural Name) to run instantly in-memory inside `ThumbnailListModel`'s dictionary array (`O(N log N)`) instead of traversing and sorting UI widgets.
-* **Dead Code Pruning**: Removed obsolete UI list queues and deprecated view refresh handlers that were left over from earlier iterations.
-
----
+* Replaced `QListWidget` with MVC `QListView` + `ThumbnailListModel` and added thread-local SQLite connection pooling.
 
 ## [Version 1.0.0-V.25] - 2026-07-01
-
-### Added
-* **Stealth Downloader Tool (Account-Safe)**: Added a built-in download tool that uses public AJAX endpoints, bypassing OAuth login and completely eliminating account ban risks.
-  * Implemented randomized download delays (2–5 seconds) and automatic session breaks (15–30 seconds after every 10 files) to prevent IP blocking.
-  * Added dynamic dialog logs (`QTextEdit`) and progress tracking.
-  * Configured automatic caching checks to skip existing files.
-  * **Pixiv Bookmark Downloader**: Integrated a safe bookmark extractor that retrieves bookmarked illust IDs (publicly or privately via `PHPSESSID` cookie) and automatically routes them to the anonymous download queue, preventing account correlation.
-  * **R-18/Restricted Support**: Enabled the `PHPSESSID` cookie option in all modes (Illust, Artist, Bookmarks) to fetch metadata of restricted/R-18 works, while keeping the actual image downloads 100% anonymous.
-  * **Ugoira (Animation) Conversion Support**: Integrated an automated Ugoira engine that downloads animated illustrations as source ZIP files and compiles them into standard animated GIF files using frame-delay metadata.
-* **Premium Dark Mode QSS Stylesheet**: Overhauled user interface with dark colors (`#121214`), rounded panels, active glow focus outlines, and customized list view cards.
-* **Vector-based Loading Overlay**: Added `LoadingSpinner` and `LoadingOverlay` widgets in [components.py](file:///d:/MyData/Desktop/test_pixiv/components.py) to render smooth animated vectors and overlay status messages while performing scans.
-* **Advanced Filter Bar**: Added size ranges and date ranges dropdown lists underneath the text search input box.
-* **SQLite-Level Advanced Filtering**: Integrated range-based SQL criteria (`size`, `mtime`, and `filename LIKE`) inside `StreamScanner` to optimize searches in the database.
-* **Chrome User-Agent**: Configured the Danbooru API name updater to supply a standard User-Agent header to avoid request blockings (403/429).
-* **Custom Application Icon**: Integrated custom window icons using the `icon.ico` resource for the main application and dialog windows.
-* **Metadata modification time (mtime)**: Enabled indexing and saving of actual file modification times (`mtime`) in the database.
-* **Random Sorting Option**: Added a "Random" sorting option to the Sort dropdown. This shuffles the folders, files, or detail views in place dynamically, allowing users to browse items randomly.
-* **Aligned Filters and Search Bar**: Repositioned the "Sort" dropdown next to the "Size" and "Date Modified" filters on the second row, leaving the first row clean for the text search bar and search controls.
-* **Dual-Mode Cover Randomization**: Added a "Quick Scan" mode to the "Randomize Covers" action to automatically scan for folders containing incomplete collages (folders with > 4 items showing fewer than 4 thumbnail quadrants) and rebuild only those, alongside the default "Full Rebuild" option.
-
-### Changed
-* **Dual-Source Name Update**: Upgraded the artist name resolution system to fetch official nicknames directly from the Pixiv public AJAX profile API first. This retrieves 100% accurate, multi-language artist names (including Japanese characters) anonymously without cookies, and falls back to Safebooru tags if blocked or not found.
-* **Folder Cover Randomization**: Added a "Randomize Covers" button and a right-click context menu option to regenerate cover collages. Rebuilding all 10,000+ folder covers at once is resource-heavy due to Disk I/O, so the right-click option allows users to randomize any individual folder collage instantly (<0.1s).
-* **Unified Search & Filter Card Panel**: Redesigned the search and filtering layout to group all controls inside a single, styled card container. Advanced file filters (Size and Date Modified) are dynamically hidden in Folders view, and the Sort dropdown updates its options contextually (File Count for Folders, File Size for Files) to avoid redundancy and clutter.
-* **Incremental Quick Sync**: Redesigned the rescan system to allow an incremental 'Quick Sync' option. This compares file sizes and modification dates on the fly, skipping unmodified files, adding new ones, and pruning deleted folders and files from SQLite in a fraction of a second without resetting the tables.
-* **Real-time SQLite Registration**: Updated the downloader workers to save newly downloaded images and artist profile mappings directly to the local SQLite database in real-time, making folder names and assets instantly visible without rescanning.
-* **Bookmark Categorization**: Updated bookmarks downloader to save files under respective numeric Artist ID folders instead of a flat bookmarks directory, ensuring uniform structure compatible with the main gallery scanner.
-* **Bookmark Page Ranges**: Integrated page range selection (e.g. from page X to Y) to limit bookmark fetching API queries and allow selective downloading.
-* **Pre-emptive Skip Optimization**: Redesigned to perform list filtering *before* the download loop. Already downloaded illustration IDs are parsed from the directory and excluded upfront. This eliminates thousands of redundant 'Skipping' logs, prevents any unnecessary API requests, and scales the progress bar to only show actual pending downloads.
-* **Max Download Limit Constraint**: Integrated a "Max Download Limit" parameter to the GUI and worker thread to allow safe batch-by-batch image retrieval.
-* **Descriptive Filename Formatting**: Updated downloaded file naming logic in all modes to use the format: `{illust_id}_p{page} - {title}.ext`. Implemented character sanitization for Windows file system safety and limited the title string length to 100 characters to prevent path overflows.
-* **Numeric Artist Folder Naming**: Changed folder naming logic in `'ILLUST'` and `'ARTIST'` download modes to create folders named exactly as the numeric Artist ID. This ensures complete compatibility with the app's metadata parser and SQLite cache mapping.
-* **Parallel Multi-Core Background Preloading**: Upgraded the background preloader thread (`BackgroundThumbnailPreloader`) to run on multiple concurrent threads using `ThreadPoolExecutor` (utilizing up to 8 CPU threads). Combined this with a start-up O(1) cache set lookup to bypass SQLite query loops, speeding up background caching by 10x while keeping database writes thread-safe and sequential.
-* **Global SQLite High-Performance Patch**: Injected an override to `sqlite3.connect` to automatically apply performance-tuning PRAGMAs (Memory-Mapped I/O, Memory Temp Store, larger Cache Size, and Normal Synchronous mode) to all database connections globally. This drastically accelerates disk reads/writes and memory throughput.
-* **Offloaded Database Writes**: Relocated all database insert and commit queries from the main GUI thread (`main.py`) to background worker threads (`workers.py`).
-* **Optimized Lazy Loading Grid Scan**: Replaced coordinate grid checks from 100+ slow `itemAt` checks to ~25 exact cell center lookups, freeing CPU cycles during scrolling.
-* **Reverted Infinite Scroll**: Reverted the lazy list loading (infinite scroll) approach to restore QListWidget sorting integrity across all items, while keeping the UI loading overlay and updates-disabled optimizations for speed.
-* **Optional OpenCV (`cv2`) Import**: Reconfigured the import of OpenCV to fail gracefully so that the app still boots if `cv2` is not installed on the system.
-
-### Fixed
-* **Missing Files on First Scan**: Fixed a severe logic bug in `StreamScanner` where newly discovered files were completely hidden from the UI on the first scan if they weren't already cached in the database. The system now guarantees that all newly detected media files are instantly pushed to the UI, regardless of database cache status, eliminating the bug where "All Animate" would sometimes show nothing or "All Files" would show partial results.
-* **Zombie Process Memory Leak**: Resolved a severe resource leak where closing the application left Python hanging in the background (consuming ~3.6GB RAM per instance) due to `ThreadPoolExecutor` and PyQt non-daemon threads blocking the shutdown hook. Implemented a forced `os._exit(0)` cleanup phase on window close to guarantee complete memory release.
-* **Stale Worker Thread CPU Lockup**: Patched an issue where switching views rapidly caused 8 concurrent `ImageLoaderWorker` threads to become locked up processing abandoned disk I/O requests. Injected a fast-abort check allowing workers to instantly terminate and return CPU resources if the main UI's `scan_gen_id` changes.
-* **Blank Video Thumbnail Fix**: Fixed a bug where heavy video/GIF files (which are skipped by the foreground loader and handled in the background) would remain as completely blank transparent boxes indefinitely. They now correctly render a dark gray placeholder box with their media type indicator (`▶`, `ZIP`) until the background preloader finishes processing them.
-* **All Animates Foreground Pool Clogging Fix**: Bypassed decoding of heavy animations/videos (OpenCV/ZIP extraction) on the foreground thread pool if they are uncached. Increased the foreground pool's maximum thread count to avoid UI blocking and queue exhaustion.
-* **Resilient Image Loader DB Locks Fix**: Resolved a race condition where database locks from background caching caused `ImageLoaderWorker` threads to silently crash and fail to emit thumbnails, leaving items frozen with default icons.
-* **Double-Trigger View Transition Fix**: Resolved a critical race condition where QRadioButton toggled signals fired twice during tab switches. Implemented state tracking via `self.current_view_mode` to ignore duplicate events and prevent thread scanner abortions.
-* **Windows Taskbar Icon Fix**: Added `ctypes` AppUserModelID definition at application launch to force Windows to group the process under its custom window icon instead of defaulting to the generic Python shell logo.
-* **Downloader Cancel Button Crash**: Patched a critical bug where `PixivDownloaderWorker` lacked a `stop()` method, which threw an `AttributeError` and forced the application to shut down when users cancelled active downloads.
-* **Multi-Page Illustration Download Fix**: Resolved a critical issue where the app would only download the first page (`_p0`) of multi-page artworks. Integrated a query to Pixiv's `/pages` endpoint to properly retrieve all original page URLs for sequential downloading.
-* **Bookmark API Endpoint Fix**: Corrected the bookmarks list retrieval URL by adding the missing `/illusts` subpath, resolving the HTTP 404 (Not Found) errors when fetching user bookmarks.
-* **Deleted Object Crash Fix**: Implemented signal disconnection during dialog close event to avoid the application crashing with C++ runtime `RuntimeError` due to threads emitting to destroyed UI widgets.
-* **Auto View Refresh**: Configured parent window to automatically refresh folder/file lists when downloading completes successfully.
-* **Avatar Overlay Logic**: Resolved a logic error where profile avatars completely replaced folder cover grids instead of overlaying on the top-left corner.
-* **Duplicate Method Declarations**: Deleted multiple duplicate method definitions (`load_visible_thumbnails`, `update_single_file_thumbnail`, and `download_image`) that were overwriting active definitions.
-* **Redundant UI Timers**: Cleaned up orphan slots (`handle_file_loaded`, `process_ui_update`) and deactivated a 30ms timer that ran continuously without target callbacks.
-
----
+* Added Account-Safe Stealth Downloader Tool, Dark Mode QSS Stylesheet, and Parallel Background Preloading.
 
 ## [Version 0.9.0-V.24] - Historical Baseline
 * Initial implementation of the Pixiv Manager app.
-* Support for local folders browsing, basic caching database, and thumbnail generation.

@@ -1,6 +1,7 @@
 import io
 import sys
 import os
+import html
 # --- Suppress C-level library warnings (libpng, OpenCV, Qt font/imageio) ---
 os.environ["OPENCV_LOG_LEVEL"] = "OFF"
 os.environ["QT_LOGGING_RULES"] = (
@@ -8,13 +9,14 @@ os.environ["QT_LOGGING_RULES"] = (
     "qt.gui.imageio=false;qt.gui.imageio.warning=false;qt.gui.icc=false;qt.gui.icc.warning=false;*.debug=false"
 )
 
-try:
-    # Redirect C-runtime file descriptor 2 (stderr) to os.devnull to silence libpng/C warnings
-    _c_devnull = os.open(os.devnull, os.O_RDWR)
-    os.dup2(_c_devnull, 2)
-    os.close(_c_devnull)
-except Exception:
-    pass
+if __name__ == "__main__" and not any(flag in sys.argv for flag in ("--console", "-c", "--debug")):
+    try:
+        # Redirect C-runtime file descriptor 2 (stderr) to os.devnull to silence libpng/C warnings in GUI mode
+        _c_devnull = os.open(os.devnull, os.O_RDWR)
+        os.dup2(_c_devnull, 2)
+        os.close(_c_devnull)
+    except Exception:
+        pass
 # --------------------------------------------------------------------------
 
 import sqlite3
@@ -26,9 +28,9 @@ def _optimized_sqlite_connect(*args, **kwargs):
     conn = _orig_sqlite_connect(*args, **kwargs)
     try:
         conn.execute('PRAGMA synchronous = NORMAL;')
-        conn.execute('PRAGMA mmap_size = 134217728;')  # 128 MB (ลดจาก 2 GB)
+        conn.execute('PRAGMA mmap_size = 134217728;')  # 128 MB
         conn.execute('PRAGMA temp_store = MEMORY;')
-        conn.execute('PRAGMA cache_size = -4000;')     # 4 MB per connection (ลดจาก 20 MB)
+        conn.execute('PRAGMA cache_size = -4000;')     # 4 MB per connection
     except Exception:
         pass
     return conn
@@ -57,13 +59,21 @@ from PyQt6.QtCore import QSize, Qt, pyqtSlot, QUrl, QTimer, QThreadPool, QPoint,
 from style_sheet import DARK_STYLESHEET
 from PyQt6.QtGui import QIcon, QPixmap, QImage, QDesktopServices, QColor, QAction, QShortcut, QKeySequence
 
-from config import DB_FILE, CONFIG_FILE, ALL_MEDIA_EXT, AppConfig
-from database import DatabaseSetup, get_file_tags, get_all_characters, get_all_series, get_all_search_suggestions
-from utils import add_indicator, format_size, overlay_avatar_on_grid, show_in_file_manager, make_thumbnail_rgb, load_media_thumbnail
-from workers import (FolderCacheScanner, ThumbnailGeneratorWorker, ImageLoaderWorker, StreamScanner, 
-                     ApiFetcherWorker, PixivDownloaderWorker, BooruNameUpdateWorker, BackgroundThumbnailPreloader,
-                     DatabaseOptimizerWorker)
-from components import LoadingOverlay
+from config import DB_FILE, CONFIG_FILE, ALL_MEDIA_EXT, AppConfig, load_app_config, update_app_config
+from database import (
+    DatabaseSetup, get_file_tags, get_all_characters, get_all_series,
+    get_all_search_suggestions, toggle_file_favorite, is_file_favorite
+)
+from utils import (
+    add_indicator, format_size, overlay_avatar_on_grid, show_in_file_manager,
+    make_thumbnail_rgb, load_media_thumbnail, safe_single_shot
+)
+from workers import (
+    FolderCacheScanner, ThumbnailGeneratorWorker, ImageLoaderWorker, StreamScanner,
+    ApiFetcherWorker, PixivDownloaderWorker, BooruNameUpdateWorker, BackgroundThumbnailPreloader,
+    DatabaseOptimizerWorker, close_all_thread_local_conns
+)
+from components import LoadingOverlay, DuplicateFinderDialog, DatasetExporterDialog
 from download_dialog import PixivDownloadDialog
 from ai_tag_dialog import AiTagDialog
 from models import ThumbnailListModel
@@ -71,8 +81,8 @@ from models import ThumbnailListModel
 class PixivManagerApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"{AppConfig.APP_NAME} (V.31) - by {AppConfig.AUTHOR}")
-        self.resize(1100, 800)
+        self.setWindowTitle(f"{AppConfig.APP_NAME} ({AppConfig.MILESTONE}) - by {AppConfig.AUTHOR}")
+        self.resize(1120, 800)
         
         icon_path = os.path.join(os.path.dirname(__file__), "icon.ico")
         if os.path.exists(icon_path):
@@ -98,6 +108,7 @@ class PixivManagerApp(QMainWindow):
         
         # --- Lazy Load & Smooth Buffer (LRU Cache) Infrastructure ---
         self.file_item_map = {}
+        self.detail_item_map = {}
         self.all_scanned_files = [] 
         self.scroll_timer = QTimer(); self.scroll_timer.setSingleShot(True)
         self.scroll_timer.timeout.connect(self.load_visible_thumbnails)
@@ -105,12 +116,18 @@ class PixivManagerApp(QMainWindow):
         # Folder lazy load timer (ultra-low debounce for instant smoothness)
         self.folder_scroll_timer = QTimer(); self.folder_scroll_timer.setSingleShot(True)
         self.folder_scroll_timer.timeout.connect(self.load_visible_folder_icons)
+
+        # Detail view lazy load timer
+        self.detail_scroll_timer = QTimer(); self.detail_scroll_timer.setSingleShot(True)
+        self.detail_scroll_timer.timeout.connect(self.load_visible_detail_thumbnails)
         
         # LRU Cache stores ordered loaded items to keep scrolling buttery smooth while capping RAM
         self.folder_icon_lru = OrderedDict()
         self.file_icon_lru = OrderedDict()
+        self.detail_icon_lru = OrderedDict()
         self.MAX_FOLDER_CACHE = 600  # ~135 MB RAM max for decoded folder covers
         self.MAX_FILE_CACHE = 400    # ~90 MB RAM max for decoded file thumbnails
+        self.MAX_DETAIL_CACHE = 300  # ~65 MB RAM max for artist detail view thumbnails
         
         self.default_file_icon = QIcon()
         pix_file = QPixmap(180, 180); pix_file.fill(QColor(40, 40, 40))
@@ -118,13 +135,13 @@ class PixivManagerApp(QMainWindow):
         # ----------------------------------------------------
 
         # --- Generation ID Control ---
-        self.scan_gen_id = 0 # เลขรุ่นของการสแกนปัจจุบัน
+        self.scan_gen_id = 0
         self.total_to_generate = 0
         self.generated_count = 0
 
         self.scan_timer = QTimer(); self.scan_timer.setInterval(50); self.scan_timer.timeout.connect(self.process_loading_queue)
 
-        # UI Setup (เหมือนเดิม)
+        # UI Setup
         central = QWidget(); self.setCentralWidget(central); main_layout = QVBoxLayout(central)
         top_bar = QHBoxLayout()
         self.btn_back = QPushButton("← Back"); self.btn_back.setObjectName("btn_back"); self.btn_back.setFixedWidth(80); self.btn_back.clicked.connect(self.go_back); self.btn_back.setVisible(False); top_bar.addWidget(self.btn_back)
@@ -145,6 +162,9 @@ class PixivManagerApp(QMainWindow):
         line = QFrame(); line.setFrameShape(QFrame.Shape.VLine); line.setFrameShadow(QFrame.Shadow.Sunken); control_bar.addWidget(line)
         self.btn_rescan = QPushButton("Rescan"); self.btn_rescan.clicked.connect(self.force_rescan_files); control_bar.addWidget(self.btn_rescan)
         self.btn_randomize_covers = QPushButton("Randomize Covers"); self.btn_randomize_covers.setObjectName("btn_randomize_covers"); self.btn_randomize_covers.clicked.connect(self.randomize_folder_covers); control_bar.addWidget(self.btn_randomize_covers)
+        self.btn_favorites = QPushButton("⭐ Favorites"); self.btn_favorites.setToolTip("Show Favorite Artworks (is:fav)"); self.btn_favorites.clicked.connect(lambda: self.apply_search_query_from_help("is:fav")); control_bar.addWidget(self.btn_favorites)
+        self.btn_duplicates = QPushButton("🔍 Duplicates"); self.btn_duplicates.setToolTip("Find Duplicate or Similar Artworks (Perceptual dHash)"); self.btn_duplicates.clicked.connect(self.open_duplicate_finder_dialog); control_bar.addWidget(self.btn_duplicates)
+        self.btn_export_dataset = QPushButton("📦 Export Dataset"); self.btn_export_dataset.setToolTip("Export Artworks + .txt Captions for LoRA / Colab"); self.btn_export_dataset.clicked.connect(self.open_dataset_exporter_dialog); control_bar.addWidget(self.btn_export_dataset)
         main_layout.addLayout(control_bar)
         
         # Unified Search & Filter Card Panel
@@ -171,7 +191,7 @@ class PixivManagerApp(QMainWindow):
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("Search:"))
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Search names or tag:... (e.g. tag:hatsune_miku)")
+        self.search_input.setPlaceholderText("Search names, tag:..., char:..., artist:..., or is:fav")
         self.search_input.returnPressed.connect(self.perform_search)
 
         # Dynamic Auto-complete & Suggestions
@@ -180,7 +200,6 @@ class PixivManagerApp(QMainWindow):
         self.search_completer.setFilterMode(Qt.MatchFlag.MatchContains)
         self.search_completer.setMaxVisibleItems(10)
         
-        # Style completer popup
         popup = self.search_completer.popup()
         popup.setStyleSheet("""
             QListView {
@@ -219,7 +238,7 @@ class PixivManagerApp(QMainWindow):
         row1.addWidget(btn_help)
         panel_layout.addLayout(row1)
 
-        # Row 2: Sort, Size, and Date Modified dropdowns (Size & Date are hidden in Folder view)
+        # Row 2: Sort, Size, and Date Modified dropdowns
         row2 = QHBoxLayout()
         row2.setContentsMargins(0, 0, 0, 0)
         row2.setSpacing(12)
@@ -236,7 +255,6 @@ class PixivManagerApp(QMainWindow):
         self.sort_combo.currentIndexChanged.connect(self.apply_sort)
         row2.addWidget(self.sort_combo)
 
-        # Advanced filter widget containing Size and Date Modified
         self.advanced_filter_widget = QWidget()
         self.advanced_filter_widget.setStyleSheet("background: transparent; border: none;")
         adv_layout = QHBoxLayout(self.advanced_filter_widget)
@@ -275,7 +293,6 @@ class PixivManagerApp(QMainWindow):
         self.char_filter.setMinimumWidth(190)
         self.char_filter.setMaximumWidth(270)
 
-        # Configure Combobox Popup View
         char_view = self.char_filter.view()
         char_view.setTextElideMode(Qt.TextElideMode.ElideNone)
         char_view.setUniformItemSizes(True)
@@ -283,7 +300,6 @@ class PixivManagerApp(QMainWindow):
         char_view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         char_view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
-        # Configure built-in QCompleter for search-while-typing
         char_comp = self.char_filter.completer()
         if char_comp:
             char_comp.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
@@ -301,7 +317,6 @@ class PixivManagerApp(QMainWindow):
             self.char_filter.lineEdit().returnPressed.connect(self.perform_search)
         self.char_filter.currentIndexChanged.connect(self.perform_search)
         adv_layout.addWidget(self.char_filter)
-
 
         row2.addWidget(self.advanced_filter_widget)
         row2.addStretch()
@@ -340,14 +355,14 @@ class PixivManagerApp(QMainWindow):
         self.list_detail.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.list_detail.customContextMenuRequested.connect(self.show_file_context_menu)
         l3.addWidget(self.list_detail); self.stacked_widget.addWidget(self.page_detail)
+        self.list_detail.verticalScrollBar().valueChanged.connect(lambda: self.detail_scroll_timer.start(20))
 
         self.status_bar = self.statusBar(); self.progress_bar = QProgressBar(); self.progress_bar.setFixedWidth(200); self.progress_bar.setVisible(False); self.status_bar.addPermanentWidget(self.progress_bar); self.status_bar.showMessage("Ready")
         self.default_folder_icon = QIcon(); pix = QPixmap(180, 180); pix.fill(QColor(80, 80, 80)); self.default_folder_icon.addPixmap(pix)
         
-        # Enable Drag & Drop for Folders
         self.setAcceptDrops(True)
 
-        # Keyboard Shortcuts (UX-01)
+        # Keyboard Shortcuts
         QShortcut(QKeySequence("F5"), self, self.force_rescan_files)
         QShortcut(QKeySequence("Ctrl+F"), self, lambda: self.search_input.setFocus())
         QShortcut(QKeySequence("Backspace"), self, self.go_back)
@@ -355,7 +370,6 @@ class PixivManagerApp(QMainWindow):
 
         self.load_config(); self.load_last_session()
         self.refresh_character_filters()
-
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -385,28 +399,23 @@ class PixivManagerApp(QMainWindow):
     
     def get_current_queue(self): return self.folder_queue if self.rb_folders.isChecked() else self.file_queue
 
-    # --- RESET EVERYTHING and BUMP GEN_ID ---
     def reset_and_kill_all(self):
         if hasattr(self, 'loading_overlay') and self.loading_overlay:
             self.loading_overlay.stop()
-        # 1. เปลี่ยนรุ่นบัตรคิว (งานเก่าที่รันอยู่จะกลายเป็นบัตรหมดอายุทันที)
         self.scan_gen_id += 1
         
-        # 2. หยุด Timer
         self.scan_timer.stop()
         self.folder_scroll_timer.stop()
+        self.detail_scroll_timer.stop()
 
-        # --- สั่งหยุด preloader ---
         if hasattr(self, 'bg_preloader') and self.bg_preloader:
             self.bg_preloader.stop()
             self.bg_preloader = None
         
-        # 3. ล้างคิวงานที่ยังไม่ได้เริ่ม
         self.bg_pool.clear() 
         self.fg_pool.clear()
         self.scan_pool.clear()
         
-        # 4. หยุด Scan Worker ตัวหลัก
         if self.scan_worker:
             self.scan_worker.stop()
             try: self.scan_worker.signals.scan_batch.disconnect()
@@ -415,9 +424,9 @@ class PixivManagerApp(QMainWindow):
             except Exception as e: logging.error(f"Disconnect error: {e}")
             self.scan_worker = None
         
-        # 5. ล้าง LRU tracking sets สำหรับ icon management
         self.folder_icon_lru.clear()
         self.file_icon_lru.clear()
+        self.detail_icon_lru.clear()
             
         self.folder_queue = []
         self.file_queue = []
@@ -425,7 +434,6 @@ class PixivManagerApp(QMainWindow):
     def refresh_view(self):
         if not self.current_folder: return
         
-        # Determine the target view mode
         if self.rb_folders.isChecked():
             target_mode = 'folders'
         elif self.rb_all.isChecked():
@@ -435,19 +443,14 @@ class PixivManagerApp(QMainWindow):
         else:
             target_mode = 'anim'
             
-        # Prevent the double-trigger bug from QRadioButton toggled signals!
         if hasattr(self, 'current_view_mode') and self.current_view_mode == target_mode:
             sender = self.sender()
-            # If triggered by toggling a radio button, block the duplicate uncheck signal
             if sender is not None and isinstance(sender, QRadioButton):
                 return
                 
         self.current_view_mode = target_mode
-        
-        # KILL ALL OLD TASKS HERE
         self.reset_and_kill_all()
 
-        # Update sort items and filter visibility dynamically based on view mode
         self.sort_combo.blockSignals(True)
         current_sort_idx = self.sort_combo.currentIndex()
         if current_sort_idx < 0: current_sort_idx = 0
@@ -457,7 +460,6 @@ class PixivManagerApp(QMainWindow):
             self.btn_randomize_covers.setVisible(True)
             self.advanced_filter_widget.setVisible(False)
             
-            # Populate sort with folder sorting options
             self.sort_combo.clear()
             self.sort_combo.addItems([
                 "Name (A-Z)", "Name (Z-A)",
@@ -469,19 +471,17 @@ class PixivManagerApp(QMainWindow):
             self.sort_combo.setCurrentIndex(min(current_sort_idx, self.sort_combo.count() - 1))
             self.sort_combo.blockSignals(False)
             
-            # Apply current sorting
             self.apply_sort(self.sort_combo.currentIndex())
             
             if self.folders_model.rowCount() == 0: self.start_scan_folders_cached(self.current_folder)
             else:
                 if self.folder_queue: self.scan_timer.start()
-                self.folder_scroll_timer.start(50)  # โหลด icon สำหรับ visible items
+                self.folder_scroll_timer.start(50)
         else:
             self.stacked_widget.setCurrentWidget(self.page_files); self.btn_rescan.setText("Rescan Files")
             self.btn_randomize_covers.setVisible(False)
             self.advanced_filter_widget.setVisible(True)
             
-            # Populate sort with file sorting options
             self.sort_combo.clear()
             self.sort_combo.addItems([
                 "Name (A-Z)", "Name (Z-A)",
@@ -493,9 +493,7 @@ class PixivManagerApp(QMainWindow):
             self.sort_combo.setCurrentIndex(min(current_sort_idx, self.sort_combo.count() - 1))
             self.sort_combo.blockSignals(False)
             
-            # Apply current sorting
             self.apply_sort(self.sort_combo.currentIndex())
-            
             self.perform_search()
 
     def start_scan_folders_cached(self, folder, force_full=False):
@@ -504,7 +502,6 @@ class PixivManagerApp(QMainWindow):
         self.status_bar.showMessage("Loading folders..."); self.progress_bar.setVisible(True)
         self.loading_overlay.start("🔍 กำลังตรวจสอบข้อมูลโฟลเดอร์...")
         
-        # Pass Current Gen ID and force_full
         self.scan_worker = FolderCacheScanner(folder, DB_FILE, self.scan_gen_id, force_full=force_full)
         self.scan_worker.signals.scan_batch.connect(self.handle_folder_cache_batch)
         self.scan_worker.signals.folder_updated.connect(self.handle_folder_updated)
@@ -514,27 +511,26 @@ class PixivManagerApp(QMainWindow):
 
     @pyqtSlot(int, list)
     def handle_folder_cache_batch(self, gen_id, batch):
-        if gen_id != self.scan_gen_id: return # ทิ้งบัตรเก่า
+        if gen_id != self.scan_gen_id: return
         new_items = []
         for data in batch:
             aid = data[0]
             name = data[1]
-            grid_blob = data[2]       # raw JPEG bytes (~10KB) หรือ None
-            profile_blob = data[3]    # avatar blob หรือ None
+            grid_blob = data[2]
+            profile_blob = data[3]
             mtime = data[4] if len(data) > 4 and data[4] is not None else 0.0
             fcount = data[5] if len(data) > 5 and data[5] is not None else 0
             ctime = data[6] if len(data) > 6 and data[6] is not None else 0.0
-            # เก็บ compressed blob แทนสร้าง QIcon (ประหยัด RAM จาก 225KB → 10KB ต่อรูป)
             item_dict = {
                 'id': aid,
                 'name': name,
-                'icon': self.default_folder_icon,  # placeholder (shared, ไม่กิน RAM เพิ่ม)
+                'icon': self.default_folder_icon,
                 'type': 'FOLDER',
                 'count': fcount,
                 'mtime': mtime,
                 'ctime': ctime,
-                'grid_blob': grid_blob,        # compressed JPEG ~10KB
-                'profile_blob': profile_blob,  # avatar blob
+                'grid_blob': grid_blob,
+                'profile_blob': profile_blob,
                 'icon_loaded': False,
             }
             new_items.append(item_dict)
@@ -546,7 +542,6 @@ class PixivManagerApp(QMainWindow):
             self.generated_count = 0
             self.status_bar.showMessage(f"Loaded list. Generating {self.total_to_generate} thumbnails...")
             if self.rb_folders.isChecked(): self.scan_timer.start()
-        # กระตุ้น lazy load สำหรับ items ที่มองเห็นบนหน้าจอ
         self.folder_scroll_timer.start(50)
 
     @pyqtSlot(int, str, str, object, int, float, float)
@@ -556,7 +551,6 @@ class PixivManagerApp(QMainWindow):
             item_dict = self.folder_item_map[aid]
             if blob_data is not None and isinstance(blob_data, (bytes, bytearray)):
                 item_dict['grid_blob'] = blob_data
-                # ถ้า item กำลังแสดงอยู่ใน LRU Cache หรือถูกโหลดไว้แล้ว → rebuild icon ทันที
                 if aid in self.folder_icon_lru or item_dict.get('icon_loaded'):
                     qimg = QImage.fromData(blob_data)
                     if not qimg.isNull():
@@ -567,7 +561,7 @@ class PixivManagerApp(QMainWindow):
                         item_dict['icon_loaded'] = True
                         self.folder_icon_lru[aid] = True
                 else:
-                    item_dict['icon_loaded'] = False  # รอ lazy load
+                    item_dict['icon_loaded'] = False
             item_dict['name'] = name
             item_dict['count'] = fcount
             if mtime: item_dict['mtime'] = mtime
@@ -578,7 +572,6 @@ class PixivManagerApp(QMainWindow):
                 idx = self.folders_model.index(row, 0)
                 self.folders_model.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DecorationRole, Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.UserRole + 2, Qt.ItemDataRole.UserRole + 3, Qt.ItemDataRole.UserRole + 4])
 
-            # ถ้าไม่มี blob → ใส่คิวให้ ThumbnailGeneratorWorker เจนปกใหม่
             if blob_data is None and aid not in self.folder_queue:
                 self.folder_queue.append(aid)
                 if not self.scan_timer.isActive() and self.rb_folders.isChecked():
@@ -587,9 +580,9 @@ class PixivManagerApp(QMainWindow):
     @pyqtSlot(int, int)
     def handle_new_folder_found(self, gen_id, count):
         if gen_id != self.scan_gen_id: return
-        self.progress_bar.setVisible(False); self.status_bar.showMessage(f"Folder list loaded."); self.apply_sort(self.sort_combo.currentIndex())
+        self.progress_bar.setVisible(False); self.status_bar.showMessage("Folder list loaded."); self.apply_sort(self.sort_combo.currentIndex())
         self.loading_overlay.stop()
-        self.folder_scroll_timer.start(50)  # โหลด icon สำหรับ visible items
+        self.folder_scroll_timer.start(50)
 
     def start_scan_all_files(self, folder, use_cache=True, filter_mode='ALL',
                              min_size=None, max_size=None, min_mtime=None, search_keyword=None,
@@ -669,7 +662,6 @@ class PixivManagerApp(QMainWindow):
                     logging.error(f"DB Error: {e}")
             self.files_model.update_data([])
             
-            kw = self.search_input.text().strip().lower()
             mode = self.last_filter_mode
             
             size_idx = self.size_filter.currentIndex()
@@ -698,7 +690,6 @@ class PixivManagerApp(QMainWindow):
     @pyqtSlot(int, list)
     def handle_stream_batch(self, gen_id, batch_files):
         if gen_id != self.scan_gen_id: return
-        # เก็บชื่อไฟล์ลงโกดังอย่างเดียว ยังไม่วาดลงจอ
         self.all_scanned_files.extend(batch_files)
         self.status_bar.showMessage(f"Found {len(self.all_scanned_files)} files...")
 
@@ -707,8 +698,7 @@ class PixivManagerApp(QMainWindow):
         if gen_id != self.scan_gen_id: return
         self.progress_bar.setVisible(False)
         self.status_bar.showMessage(f"Building UI for {total_count} files. Please wait...")
-        from PyQt6.QtWidgets import QApplication
-        QApplication.processEvents() # ให้ UI กระพริบอัปเดตข้อความก่อน
+        QApplication.processEvents()
 
         new_items = []
         for item_data in self.all_scanned_files:
@@ -734,17 +724,13 @@ class PixivManagerApp(QMainWindow):
         self.apply_sort(self.sort_combo.currentIndex())
         self.status_bar.showMessage(f"Ready. Showing {total_count} files. (Background caching started...)")
 
-        # กระตุ้นให้โหลดรูปเฉพาะหน้าแรกที่โชว์อยู่ทันที (25ms)
         self.scroll_timer.start(25)
 
-        # --- [เพิ่ม] เริ่มระบบทำแคชพื้นหลัง ---
-        # ดึงมาเฉพาะ path จาก self.all_scanned_files แล้วล้างทิ้งเพื่อ free RAM
         paths_only = [item[0] if isinstance(item, tuple) else item for item in self.all_scanned_files]
-        self.all_scanned_files = []  # ข้อมูลถูก copy ไปแล้ว คืน RAM กลับคืน
+        self.all_scanned_files = []
         
         from workers import BackgroundThumbnailPreloader
         self.bg_preloader = BackgroundThumbnailPreloader(paths_only, DB_FILE, self.scan_gen_id)
-        # โยนให้ bg_pool ทำงาน จะได้ไม่ไปแย่งคิวโหลดรูปของหน้าจอ (fg_pool)
         self.bg_pool.start(self.bg_preloader)
         self.loading_overlay.stop()
 
@@ -758,16 +744,13 @@ class PixivManagerApp(QMainWindow):
         if self.bg_pool.activeThreadCount() >= self.bg_pool.maxThreadCount() or self.fg_pool.activeThreadCount() >= self.fg_pool.maxThreadCount(): return
         batch = queue[:20]
         if self.rb_folders.isChecked(): self.folder_queue = self.folder_queue[20:]
-        else: self.file_queue = self.file_queue[20:] # file_queue is unused but kept for backwards compatibility if needed
+        else: self.file_queue = self.file_queue[20:]
         
         is_folder_task = isinstance(batch[0], str) 
         if is_folder_task:
             for aid in batch:
-                # Pass Current Gen ID to Worker
                 w = ThumbnailGeneratorWorker(aid, os.path.join(self.current_folder, aid), DB_FILE, self.scan_gen_id, force_update=self.force_thumbnail_update, quick_randomize=self.quick_randomize_covers)
                 w.signals.folder_updated.connect(self.handle_folder_updated); self.bg_pool.start(w)
-
-
 
     def handle_main_click(self, index):
         if not index.isValid(): return
@@ -783,18 +766,155 @@ class PixivManagerApp(QMainWindow):
     def open_artist_folder(self, aid):
         path = os.path.join(self.current_folder, aid)
         if not os.path.exists(path): return
-        self.scan_timer.stop(); self.stacked_widget.setCurrentWidget(self.page_detail); self.btn_back.setVisible(True); self.path_input.setText(path); self.load_detail_images(path)
+        self.scan_timer.stop()
+        self.stacked_widget.setCurrentWidget(self.page_detail)
+        self.btn_back.setVisible(True)
+        self.path_input.setText(path)
+        self.load_detail_images(path)
 
     def load_detail_images(self, path):
-        self.detail_model.update_data([]); self.fg_pool.clear()
+        """Loads artist folder images using Viewport Lazy Loading & LRU Cache for instant open and low RAM."""
+        self.detail_model.update_data([])
+        self.detail_item_map.clear()
+        self.detail_icon_lru.clear()
+        self.fg_pool.clear()
         try:
-            files = [os.path.join(path, f) for f in os.listdir(path) if os.path.splitext(f)[1].lower() in ALL_MEDIA_EXT and not f.startswith('.')]
+            files = [
+                os.path.join(path, f)
+                for f in os.listdir(path)
+                if os.path.splitext(f)[1].lower() in ALL_MEDIA_EXT and not f.startswith('.')
+            ]
         except Exception:
             files = []
-        for f in files: w = ImageLoaderWorker(f, DB_FILE, self.scan_gen_id, lambda: self.scan_gen_id); w.signals.image_loaded.connect(self.add_detail_item); self.fg_pool.start(w)
 
-    @pyqtSlot(int, str, QImage, str) # Update signature
+        new_items = []
+        for f in files:
+            try:
+                st = os.stat(f)
+                size = st.st_size
+                mtime = st.st_mtime
+                ctime = st.st_ctime
+            except Exception:
+                size = 0
+                mtime = 0.0
+                ctime = 0.0
+
+            item_dict = {
+                'id': f,
+                'name': os.path.basename(f),
+                'icon': self.default_file_icon,
+                'type': 'FILE',
+                'count': size,
+                'mtime': mtime,
+                'ctime': ctime,
+                'loaded': False
+            }
+            new_items.append(item_dict)
+            self.detail_item_map[f] = item_dict
+
+        self.detail_model.update_data(new_items)
+        self.apply_sort(self.sort_combo.currentIndex())
+        self.status_bar.showMessage(f"Showing {len(new_items)} files in {os.path.basename(path)}")
+        self.detail_scroll_timer.start(15)
+
+        if files:
+            self.bg_preloader = BackgroundThumbnailPreloader(files, DB_FILE, self.scan_gen_id)
+            self.bg_pool.start(self.bg_preloader)
+
+    def load_visible_detail_thumbnails(self):
+        try:
+            if self.stacked_widget.currentWidget() != self.page_detail:
+                return
+
+            total_items = self.detail_model.rowCount()
+            if total_items == 0:
+                return
+
+            viewport = self.list_detail.viewport()
+            w = viewport.width()
+            h = viewport.height()
+            if w <= 0 or h <= 0:
+                min_row, max_row = 0, min(total_items - 1, 40)
+            else:
+                rows = []
+                step_y = max(30, h // 8)
+                step_x = max(30, w // 6)
+                for y in range(0, h + step_y, step_y):
+                    cy = min(y, h - 1)
+                    for x in range(0, w + step_x, step_x):
+                        cx = min(x, w - 1)
+                        idx = self.list_detail.indexAt(QPoint(cx, cy))
+                        if idx.isValid():
+                            rows.append(idx.row())
+                if not rows:
+                    min_row, max_row = 0, min(total_items - 1, 40)
+                else:
+                    min_row, max_row = min(rows), max(rows)
+
+            buf_start = max(0, min_row - 25)
+            buf_end = min(total_items, max_row + 60)
+
+            current_active_paths = set()
+            for r in range(buf_start, buf_end):
+                item_dict = self.detail_model.get_item_data(r)
+                if not item_dict:
+                    continue
+                path = item_dict['id']
+                current_active_paths.add(path)
+
+                if not item_dict.get('loaded', False):
+                    item_dict['loaded'] = True
+                    worker = ImageLoaderWorker(path, DB_FILE, self.scan_gen_id, lambda: self.scan_gen_id)
+                    worker.signals.image_loaded.connect(self.update_single_detail_thumbnail)
+                    self.fg_pool.start(worker)
+                else:
+                    if path in self.detail_icon_lru:
+                        self.detail_icon_lru.move_to_end(path)
+
+            while len(self.detail_icon_lru) > self.MAX_DETAIL_CACHE:
+                old_path, _ = self.detail_icon_lru.popitem(last=False)
+                if old_path not in current_active_paths:
+                    item_dict = self.detail_item_map.get(old_path)
+                    if item_dict and item_dict.get('loaded'):
+                        item_dict['icon'] = self.default_file_icon
+                        item_dict['loaded'] = False
+                        row = self.detail_model.get_row_by_id(old_path)
+                        if row >= 0:
+                            idx = self.detail_model.index(row, 0)
+                            self.detail_model.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DecorationRole])
+        except Exception as e:
+            logging.debug(f"Exception in load_visible_detail_thumbnails: {e}")
+
+    @pyqtSlot(int, str, QImage, str)
+    def update_single_detail_thumbnail(self, gen_id, path, qimg, ftype):
+        try:
+            if gen_id != self.scan_gen_id:
+                return
+            if path in self.detail_item_map:
+                item_dict = self.detail_item_map[path]
+                if qimg and not qimg.isNull():
+                    pix = QPixmap.fromImage(qimg)
+                else:
+                    pix = QPixmap(240, 240)
+                    pix.fill(QColor(40, 40, 40))
+                pix = add_indicator(pix, ftype)
+                item_dict['icon'] = QIcon(pix)
+
+                self.detail_icon_lru[path] = True
+                self.detail_icon_lru.move_to_end(path)
+
+                row = self.detail_model.get_row_by_id(path)
+                if row >= 0:
+                    idx = self.detail_model.index(row, 0)
+                    self.detail_model.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DecorationRole])
+        except RuntimeError:
+            pass
+
+    @pyqtSlot(int, str, QImage, str)
     def add_detail_item(self, gen_id, path, qimg, ftype):
+        if path in self.detail_item_map:
+            self.update_single_detail_thumbnail(gen_id, path, qimg, ftype)
+            return
         if qimg and not qimg.isNull():
             pix = QPixmap.fromImage(qimg)
         else:
@@ -809,7 +929,7 @@ class PixivManagerApp(QMainWindow):
             size = st.st_size
             mtime = st.st_mtime
             ctime = st.st_ctime
-        except:
+        except Exception:
             size = 0
             mtime = 0.0
             ctime = 0.0
@@ -823,6 +943,7 @@ class PixivManagerApp(QMainWindow):
             'mtime': mtime,
             'ctime': ctime
         }
+        self.detail_item_map[path] = item_dict
         self.detail_model.append_items([item_dict])
 
     def open_image_external(self, index):
@@ -899,6 +1020,12 @@ class PixivManagerApp(QMainWindow):
         action_lightbox.triggered.connect(lambda: self.open_lightbox_viewer(index.row(), sender_list.model()))
         menu.addAction(action_lightbox)
 
+        is_fav = is_file_favorite(DB_FILE, file_path)
+        fav_label = "⭐ Remove from Favorites" if is_fav else "☆ Add to Favorites (is:fav)"
+        action_fav = QAction(fav_label, self)
+        action_fav.triggered.connect(lambda: self.toggle_favorite_for_file(file_path))
+        menu.addAction(action_fav)
+
         action_open = QAction("🖼️ Open in Windows Photos (ภายนอก)", self)
         action_open.triggered.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(file_path)))
         menu.addAction(action_open)
@@ -917,6 +1044,11 @@ class PixivManagerApp(QMainWindow):
 
         menu.exec(sender_list.mapToGlobal(pos))
 
+    def toggle_favorite_for_file(self, file_path):
+        now_fav = toggle_file_favorite(DB_FILE, file_path)
+        fname = os.path.basename(file_path)
+        self.status_bar.showMessage(f"{'⭐ Added to Favorites' if now_fav else '☆ Removed from Favorites'}: {fname}", 3000)
+
     def regenerate_file_thumbnail(self, file_path, row_idx, model):
         try:
             pil_img, ftype = load_media_thumbnail(file_path)
@@ -926,12 +1058,10 @@ class PixivManagerApp(QMainWindow):
                 thumb_img.save(bio, 'JPEG', quality=85)
                 blob = bio.getvalue()
 
-                # Update SQLite database cache
                 cursor = self.main_db_conn.cursor()
                 cursor.execute("INSERT OR REPLACE INTO file_thumbnails (path, image_data) VALUES (?, ?)", (file_path, blob))
                 self.main_db_conn.commit()
 
-                # Update UI immediately
                 qimg = QImage()
                 qimg.loadFromData(blob)
                 pix = QPixmap.fromImage(qimg)
@@ -941,6 +1071,9 @@ class PixivManagerApp(QMainWindow):
                 if file_path in self.file_item_map:
                     self.file_item_map[file_path]['icon'] = new_icon
                     self.file_item_map[file_path]['loaded'] = True
+                if file_path in self.detail_item_map:
+                    self.detail_item_map[file_path]['icon'] = new_icon
+                    self.detail_item_map[file_path]['loaded'] = True
 
                 model.update_icon(row_idx, new_icon)
                 self.status_bar.showMessage(f"Thumbnail regenerated for: {os.path.basename(file_path)}", 3000)
@@ -960,7 +1093,7 @@ class PixivManagerApp(QMainWindow):
         dlg_layout.setContentsMargins(16, 16, 16, 16)
         dlg_layout.setSpacing(12)
 
-        lbl_fn = QLabel(f"<b>File:</b> {os.path.basename(file_path)}")
+        lbl_fn = QLabel(f"<b>File:</b> {html.escape(os.path.basename(file_path))}")
         lbl_fn.setWordWrap(True)
         dlg_layout.addWidget(lbl_fn)
 
@@ -978,31 +1111,39 @@ class PixivManagerApp(QMainWindow):
         """)
 
         html_content = []
-        if tags and tags.get('all'):
-            # Characters
+        if tags and (tags.get('all') or tags.get('custom') or tags.get('is_favorite')):
+            if tags.get('is_favorite'):
+                html_content.append("<b style='color: #fbbf24;'>⭐ Status:</b> Favorited (is:fav)<br><br>")
+
+            if tags.get('custom'):
+                html_content.append("<b style='color: #fcd34d;'>⭐ Custom Tags:</b><br>")
+                custom_str = ", ".join([f"<b>#{html.escape(str(c[0]))}</b>" for c in tags['custom']])
+                html_content.append(f"&nbsp;&nbsp;{custom_str}<br><br>")
+
             if tags.get('characters'):
                 html_content.append("<b style='color: #60a5fa;'>👤 Characters:</b><br>")
                 for c, conf in tags['characters']:
-                    html_content.append(f"&nbsp;&nbsp;• <b>{c.replace('_', ' ').title()}</b> ({c}) — <span style='color:#34d399;'>{int(conf*100)}%</span><br>")
+                    c_esc = html.escape(str(c))
+                    c_title = html.escape(c.replace('_', ' ').title())
+                    html_content.append(f"&nbsp;&nbsp;• <b>{c_title}</b> ({c_esc}) — <span style='color:#34d399;'>{int(conf*100)}%</span><br>")
                 html_content.append("<br>")
             
-            # Series
             if tags.get('series'):
                 html_content.append("<b style='color: #a78bfa;'>📚 Series:</b><br>")
                 for s, conf in tags['series']:
-                    html_content.append(f"&nbsp;&nbsp;• <b>{s.replace('_', ' ').title()}</b> ({s}) — <span style='color:#34d399;'>{int(conf*100)}%</span><br>")
+                    s_esc = html.escape(str(s))
+                    s_title = html.escape(s.replace('_', ' ').title())
+                    html_content.append(f"&nbsp;&nbsp;• <b>{s_title}</b> ({s_esc}) — <span style='color:#34d399;'>{int(conf*100)}%</span><br>")
                 html_content.append("<br>")
 
-            # Rating
             if tags.get('rating'):
-                r = tags['rating']
+                r = str(tags['rating'])
                 r_color = "#34d399" if r == "general" else "#f59e0b" if r in ("sensitive", "questionable") else "#ef4444"
-                html_content.append(f"<b style='color: #fbbf24;'>🔞 Content Rating:</b> <span style='color: {r_color}; font-weight: bold;'>{r.upper()}</span><br><br>")
+                html_content.append(f"<b style='color: #fbbf24;'>🔞 Content Rating:</b> <span style='color: {r_color}; font-weight: bold;'>{html.escape(r.upper())}</span><br><br>")
 
-            # General Tags
             if tags.get('general'):
                 html_content.append("<b style='color: #9ca3af;'>🏷️ General Tags:</b><br>")
-                gen_tags = ", ".join([f"<span style='color:#d1d5db;'>{g[0]}</span> ({int(g[1]*100)}%)" for g in tags['general']])
+                gen_tags = ", ".join([f"<span style='color:#d1d5db;'>{html.escape(str(g[0]))}</span> ({int(g[1]*100)}%)" for g in tags['general']])
                 html_content.append(f"&nbsp;&nbsp;{gen_tags}<br>")
         else:
             html_content.append("<p style='color: #9ca3af;'>ℹ️ This image has not been scanned with AI Tagger yet.<br>Click <b>'🤖 AI Tagger'</b> on the top toolbar to scan your library.</p>")
@@ -1013,11 +1154,11 @@ class PixivManagerApp(QMainWindow):
         btn_row = QHBoxLayout()
         btn_copy = QPushButton("📋 Copy All Tags")
         def copy_tags():
-            all_tag_names = [t[0] for t in tags.get('all', []) if t[0] != '__none__']
+            all_tag_names = [t[0] for t in (tags.get('all', []) if tags else []) if t[0] not in ('__none__', 'favorite')]
             if all_tag_names:
                 QApplication.clipboard().setText(", ".join(all_tag_names))
                 btn_copy.setText("✅ Copied!")
-                QTimer.singleShot(1500, lambda: btn_copy.setText("📋 Copy All Tags"))
+                safe_single_shot(1500, btn_copy, lambda: btn_copy.setText("📋 Copy All Tags"))
         btn_copy.clicked.connect(copy_tags)
         btn_row.addWidget(btn_copy)
 
@@ -1054,7 +1195,6 @@ class PixivManagerApp(QMainWindow):
             
         self.reset_and_kill_all()
         
-        # Clear UI folders list
         self.folders_model.update_data([])
         self.folder_item_map.clear()
         
@@ -1065,18 +1205,20 @@ class PixivManagerApp(QMainWindow):
             self.force_thumbnail_update = True
             self.quick_randomize_covers = False
             
-        # Start scan cached
         self.start_scan_folders_cached(self.current_folder)
 
     def go_back(self):
-        self.fg_pool.clear(); self.detail_model.update_data([])
+        self.detail_scroll_timer.stop()
+        self.fg_pool.clear()
+        self.detail_model.update_data([])
+        self.detail_item_map.clear()
+        self.detail_icon_lru.clear()
         if self.rb_folders.isChecked():
             self.stacked_widget.setCurrentWidget(self.page_folders)
-            self.folder_scroll_timer.start(25)  # โหลด icon visible items
+            self.folder_scroll_timer.start(25)
         else:
             self.stacked_widget.setCurrentWidget(self.page_files)
-            self.scroll_timer.start(25)  # โหลด icon visible file items
-        # Don't restart queue automatically to prevent confusion, or restart if queue exists
+            self.scroll_timer.start(25)
         if self.get_current_queue(): self.scan_timer.start()
         self.btn_back.setVisible(False); self.path_input.setText(self.current_folder)
 
@@ -1103,14 +1245,12 @@ class PixivManagerApp(QMainWindow):
         if parsed_q.rating and parsed_q.rating != 'ALL':
             active_rating = parsed_q.rating
 
-        # If user searched for tags, character, rating, or file types while in folder view, switch to all files view
         if self.rb_folders.isChecked():
             has_tag_search = parsed_q.has_tag_or_rating_filter(active_rating=active_rating) or (active_rating != 'ALL') or bool(parsed_q.file_types)
             if has_tag_search:
                 self.rb_all.setChecked(True)
                 return
 
-            # ในโหมดโฟลเดอร์ ค้นหาแบบกรองในหน่วยความจำ (กรอง folder_item_map แล้วอัปเดต model)
             kw = raw_text.lower()
             all_items = list(self.folder_item_map.values())
             if kw:
@@ -1120,10 +1260,8 @@ class PixivManagerApp(QMainWindow):
             self.folders_model.update_data(filtered)
             self.apply_sort(self.sort_combo.currentIndex())
             self.status_bar.showMessage(f"Found {len(filtered)} folders.")
-            self.folder_scroll_timer.start(50)  # โหลด icon visible items
+            self.folder_scroll_timer.start(50)
         else:
-            # ในโหมดไฟล์ ทำการส่ง SQL ค้นหาและกรองข้อมูลหลังบ้านเพื่อความรวดเร็ว
-            # แปลงค่า Size Filter
             size_idx = self.size_filter.currentIndex()
             min_size, max_size = None, None
             if size_idx == 1:
@@ -1142,7 +1280,6 @@ class PixivManagerApp(QMainWindow):
             if parsed_q.max_size:
                 max_size = parsed_q.max_size
 
-            # แปลงค่า Date Filter
             date_idx = self.date_filter.currentIndex()
             min_mtime = None
             if date_idx == 1:
@@ -1154,12 +1291,10 @@ class PixivManagerApp(QMainWindow):
             elif date_idx == 4:
                 min_mtime = time.time() - 365 * 24 * 60 * 60
 
-            # ประเภทการกรอง (All, Photo, Animate)
             mode = 'ALL'
             if self.rb_photos.isChecked(): mode = 'PHOTO'
             elif self.rb_anim.isChecked(): mode = 'ANIMATE'
 
-            # Character Filter from Combobox
             char_filter_val = None
             if hasattr(self, 'char_filter'):
                 char_filter_val = self.char_filter.currentData()
@@ -1203,6 +1338,19 @@ class PixivManagerApp(QMainWindow):
         dlg = DashboardDialog(self, on_apply_query=self.apply_search_query_from_help)
         dlg.exec()
 
+    def open_duplicate_finder_dialog(self):
+        dlg = DuplicateFinderDialog(self, root_path=self.current_folder or None, db_file=DB_FILE)
+        dlg.exec()
+
+    def open_dataset_exporter_dialog(self):
+        current_paths = []
+        if self.stacked_widget.currentWidget() == self.page_detail:
+            current_paths = [it.get('id') for it in self.detail_model._data if it.get('id')]
+        elif self.stacked_widget.currentWidget() == self.page_files:
+            current_paths = [it.get('id') for it in self.files_model._data if it.get('id')]
+        dlg = DatasetExporterDialog(self, file_paths=current_paths, db_file=DB_FILE)
+        dlg.exec()
+
     def refresh_character_filters(self):
         if hasattr(self, 'char_filter'):
             current_data = self.char_filter.currentData()
@@ -1214,7 +1362,6 @@ class PixivManagerApp(QMainWindow):
                 display_name = c.replace('_', ' ').title()
                 self.char_filter.addItem(f"{display_name} ({c})", c)
             
-            # Ensure popup view does not truncate long character names
             self.char_filter.view().setTextElideMode(Qt.TextElideMode.ElideNone)
             self.char_filter.view().setUniformItemSizes(True)
             self.char_filter.view().setMinimumWidth(380)
@@ -1236,7 +1383,6 @@ class PixivManagerApp(QMainWindow):
                 self.char_filter.setCurrentIndex(0)
             self.char_filter.blockSignals(False)
 
-        # Update search suggestions / autocomplete list
         if hasattr(self, 'search_completer'):
             suggestions = get_all_search_suggestions(DB_FILE)
             model = QStringListModel(suggestions, self.search_completer)
@@ -1250,24 +1396,29 @@ class PixivManagerApp(QMainWindow):
 
         model.sort(index)
         
-        # โหลดรูปสำหรับตำแหน่งใหม่หลังจากการจัดเรียงทันที
         if self.stacked_widget.currentWidget() == self.page_folders:
             self.folder_scroll_timer.start(10)
         elif self.stacked_widget.currentWidget() == self.page_files:
             self.scroll_timer.start(10)
+        elif self.stacked_widget.currentWidget() == self.page_detail:
+            self.detail_scroll_timer.start(10)
+
     def stop_all(self): 
         self.reset_and_kill_all()
+
     def load_config(self):
-        if os.path.exists(CONFIG_FILE): 
-            try:
-                with open(CONFIG_FILE, 'r') as f:
-                    self.config = json.load(f)
-            except Exception as e:
-                logging.error(f"Config load error: {e}")
-                self.config = {}
+        try:
+            self.config = load_app_config()
+        except Exception as e:
+            logging.error(f"Config load error: {e}")
+            self.config = {}
+
     def save_config(self):
-        with open(CONFIG_FILE, 'w') as f:
-            json.dump(self.config, f)
+        try:
+            self.config = update_app_config(self.config)
+        except Exception as e:
+            logging.error(f"Config save error: {e}")
+
     def browse_folder(self):
         f = QFileDialog.getExistingDirectory(self, "Select Folder")
         if f:
@@ -1289,21 +1440,18 @@ class PixivManagerApp(QMainWindow):
             self.folder_item_map.clear()
             self.current_view_mode = None
             QTimer.singleShot(100, self.refresh_view)
+
     def start_name_update(self):
-        # 1. กวาดรายชื่อที่ยังเป็นตัวเลข ID ทั้งหมดจาก model แบบรวดเดียวจบ!
         targets = []
         for item_dict in self.folders_model._data:
             aid = str(item_dict.get('id', ''))
             current_name = item_dict.get('name', '')
-            
-            # เช็คว่าข้อความคือ "ID" เพียวๆ หรือ "ID (ตามด้วยวงเล็บ)"
             if current_name == aid or current_name.startswith(f"{aid} ("):
                 targets.append(aid)
                 
         if not targets: 
             return QMessageBox.information(self, "Info", "ไม่มีโฟลเดอร์ไหนต้องอัปเดตชื่อแล้วครับ สมบูรณ์ 100%!")
             
-        # 2. ป้องกันความตกใจ ถ้าเจอเยอะจัด (เช่น เกิน 1000 โฟลเดอร์)
         if len(targets) > 1000:
             reply = QMessageBox.question(self, "จัดชุดใหญ่!", 
                                          f"พบ {len(targets)} โฟลเดอร์ที่ต้องอัปเดต!\nการรันทั้งหมดรวดเดียวอาจใช้เวลาสักพัก\nยืนยันที่จะลุยเลยไหม?", 
@@ -1313,13 +1461,11 @@ class PixivManagerApp(QMainWindow):
                 
         self.status_bar.showMessage(f"กำลังลุยอัปเดตชื่อรวดเดียว {len(targets)} คน... (จิบกาแฟรอได้เลย ☕)")
         
-        # 3. โยนงานทั้งหมดให้ Worker (ลูกน้อง 3 คน) ไปรุมสแกนแบบไม่หยุดพัก
         w = BooruNameUpdateWorker(targets)
         w.signals.api_updated.connect(self.handle_api_update)
         w.signals.api_log.connect(lambda msg: self.status_bar.showMessage(msg))
         self.api_pool.start(w)
 
-    # แก้ไข slot นี้เพื่อจัดการ UI (การเซฟลงฐานข้อมูลทำเสร็จตั้งแต่ใน Background Thread แล้ว)
     @pyqtSlot(str, str, object)
     def handle_api_update(self, aid, name, avatar_blob):
         item_dict = self.folder_item_map.get(aid)
@@ -1328,7 +1474,6 @@ class PixivManagerApp(QMainWindow):
             
             if avatar_blob:
                 item_dict['profile_blob'] = avatar_blob
-                # ถ้ากำลังแสดงอยู่ใน LRU Cache หรือเคยโหลดไว้ → rebuild icon พร้อม avatar ใหม่ทันที
                 if aid in self.folder_icon_lru or item_dict.get('icon_loaded'):
                     grid_blob = item_dict.get('grid_blob')
                     if grid_blob:
@@ -1359,7 +1504,6 @@ class PixivManagerApp(QMainWindow):
             if w <= 0 or h <= 0:
                 return
 
-            # สแกนตำแหน่งบนจอเพื่อหา index ของแถวแรกและแถวสุดท้ายที่ปรากฏใน Viewport
             rows = []
             step_y = max(30, h // 8)
             step_x = max(30, w // 6)
@@ -1378,7 +1522,6 @@ class PixivManagerApp(QMainWindow):
                 min_row = min(rows)
                 max_row = max(rows)
 
-            # Smooth Overscan Buffer: โหลดล่วงหน้าขึ้นไปข้างบน 50 รูป และลงไปข้างล่าง 120 รูป
             buf_start = max(0, min_row - 50)
             buf_end = min(total_items, max_row + 120)
 
@@ -1392,7 +1535,6 @@ class PixivManagerApp(QMainWindow):
                 aid = item_dict['id']
                 current_active_ids.add(aid)
 
-                # อัปเดตลำดับใน LRU Cache
                 self.folder_icon_lru[aid] = True
                 self.folder_icon_lru.move_to_end(aid)
 
@@ -1408,7 +1550,6 @@ class PixivManagerApp(QMainWindow):
                     item_dict['icon_loaded'] = True
                     changed_rows.append(r)
 
-            # อัปเดต UI พร้อมกันเป็นชุด (Batch Signal)
             if changed_rows:
                 min_c = min(changed_rows)
                 max_c = max(changed_rows)
@@ -1416,7 +1557,6 @@ class PixivManagerApp(QMainWindow):
                 bottom_idx = self.folders_model.index(max_c, 0)
                 self.folders_model.dataChanged.emit(top_idx, bottom_idx, [Qt.ItemDataRole.DecorationRole])
 
-            # Evict เฉพาะรูปที่เก่าที่สุดเมื่อเกินขนาดแคช (MAX_FOLDER_CACHE = 600)
             while len(self.folder_icon_lru) > self.MAX_FOLDER_CACHE:
                 old_aid, _ = self.folder_icon_lru.popitem(last=False)
                 if old_aid not in current_active_ids:
@@ -1430,9 +1570,7 @@ class PixivManagerApp(QMainWindow):
                             self.folders_model.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DecorationRole])
 
         except Exception as e:
-            import traceback
-            print(f"[main.py] Exception in load_visible_folder_icons: {e}")
-            traceback.print_exc()
+            logging.debug(f"[main.py] Exception in load_visible_folder_icons: {e}")
 
     # === Smooth Buffer & LRU Cache (File View) ===
     def load_visible_thumbnails(self):
@@ -1468,7 +1606,6 @@ class PixivManagerApp(QMainWindow):
                 min_row = min(rows)
                 max_row = max(rows)
 
-            # Smooth Overscan Buffer: โหลดล่วงหน้าขึ้นไปข้างบน 30 รูป และลงไปข้างล่าง 80 รูป
             buf_start = max(0, min_row - 30)
             buf_end = min(total_items, max_row + 80)
 
@@ -1489,7 +1626,6 @@ class PixivManagerApp(QMainWindow):
                     if path in self.file_icon_lru:
                         self.file_icon_lru.move_to_end(path)
 
-            # Evict เฉพาะรูปที่เก่าที่สุดเมื่อเกินขนาดแคช (MAX_FILE_CACHE = 400)
             while len(self.file_icon_lru) > self.MAX_FILE_CACHE:
                 old_path, _ = self.file_icon_lru.popitem(last=False)
                 if old_path not in current_active_paths:
@@ -1503,9 +1639,7 @@ class PixivManagerApp(QMainWindow):
                             self.files_model.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DecorationRole])
 
         except Exception as e:
-            import traceback
-            print(f"[main.py] Exception in load_visible_thumbnails: {e}")
-            traceback.print_exc()
+            logging.debug(f"[main.py] Exception in load_visible_thumbnails: {e}")
 
     @pyqtSlot(int, str, QImage, str)
     def update_single_file_thumbnail(self, gen_id, path, qimg, ftype):
@@ -1521,7 +1655,6 @@ class PixivManagerApp(QMainWindow):
                 pix = add_indicator(pix, ftype)
                 item_dict['icon'] = QIcon(pix)
                 
-                # บันทึกลง LRU Cache
                 self.file_icon_lru[path] = True
                 self.file_icon_lru.move_to_end(path)
                 
@@ -1532,34 +1665,29 @@ class PixivManagerApp(QMainWindow):
         except RuntimeError:
             pass
         except Exception as e:
-            import traceback
-            print(f"[main.py] Exception in update_single_file_thumbnail for {path}: {e}")
-            traceback.print_exc()
+            logging.debug(f"[main.py] Exception in update_single_file_thumbnail for {path}: {e}")
 
     def optimize_database(self):
         msg = QMessageBox.question(self, "Optimize Database",
-                                   "This will compact and defragment the SQLite database (VACUUM & WAL Truncate) to reclaim disk space.\n\n"
+                                   "This will clean up orphaned records, compact, and defragment the SQLite database (VACUUM & WAL Truncate) to reclaim disk space.\n\n"
                                    "This may take a few moments. Do you want to proceed?",
                                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if msg == QMessageBox.StandardButton.Yes:
-            # 1. Stop all workers and timers to release any open DB locks/transactions
             self.reset_and_kill_all()
             self.status_bar.showMessage("Optimizing & Compacting Database...")
             self.loading_overlay.start("🧹 กำลังบีบอัดและจัดระเบียบฐานข้อมูล (VACUUM)...")
             
-            # 2. Close main connection temporarily so VACUUM gets exclusive lock without error
+            close_all_thread_local_conns()
             try:
                 self.main_db_conn.close()
             except Exception:
                 pass
                 
-            # 3. Run VACUUM in background worker so UI spinner animates smoothly
             w = DatabaseOptimizerWorker(DB_FILE)
             w.signals.api_log.connect(self.handle_optimize_finished)
             self.bg_pool.start(w)
 
     def handle_optimize_finished(self, status):
-        # Re-open main connection
         self.main_db_conn = sqlite3.connect(DB_FILE, check_same_thread=False)
         self.loading_overlay.stop()
         if status == "SUCCESS":
@@ -1580,6 +1708,8 @@ class PixivManagerApp(QMainWindow):
                 self.folder_scroll_timer.start(15)
             elif self.stacked_widget.currentWidget() == self.page_files:
                 self.scroll_timer.start(25)
+            elif self.stacked_widget.currentWidget() == self.page_detail:
+                self.detail_scroll_timer.start(20)
 
     def changeEvent(self, event):
         super().changeEvent(event)
@@ -1589,7 +1719,8 @@ class PixivManagerApp(QMainWindow):
                     self.folder_scroll_timer.start(15)
                 elif self.stacked_widget.currentWidget() == self.page_files:
                     self.scroll_timer.start(25)
-            # Synchronize child/modal dialogs with main window minimize/restore
+                elif self.stacked_widget.currentWidget() == self.page_detail:
+                    self.detail_scroll_timer.start(20)
             if not self.isMinimized():
                 for w in QApplication.topLevelWidgets():
                     if isinstance(w, QDialog) and w.isVisible() and w.isMinimized():
@@ -1603,23 +1734,23 @@ class PixivManagerApp(QMainWindow):
 
     def closeEvent(self, e): 
         self.stop_all()
+        close_all_thread_local_conns()
         try:
             self.main_db_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         except Exception:
             pass
-        self.main_db_conn.close()
+        try:
+            self.main_db_conn.close()
+        except Exception:
+            pass
         e.accept()
-        # [ดักจับ] ป้องกัน Thread ยืดเยื้อหรือแขวนอยู่บน Memory (Zombie Process)
-        import os
         QTimer.singleShot(100, lambda: os._exit(0))
 
 
-
 if __name__ == "__main__":
-    # Windows Taskbar Icon Fix: Set a unique AppUserModelID so Windows treats this as a separate app
     try:
         import ctypes
-        myappid = 'krit.pixivmanager.app.v25'
+        myappid = 'krit.pixivmanager.app.v32'
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
     except Exception:
         pass
@@ -1629,4 +1760,3 @@ if __name__ == "__main__":
     window = PixivManagerApp()
     window.show()
     sys.exit(app.exec())
-    

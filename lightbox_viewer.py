@@ -1,5 +1,6 @@
 import os
 import sys
+import html
 import subprocess
 import logging
 from PIL import Image
@@ -12,7 +13,7 @@ except ImportError:
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QWidget,
     QScrollArea, QFrame, QApplication, QSplitter, QSizePolicy, QComboBox,
-    QStackedWidget, QSlider
+    QStackedWidget, QSlider, QLineEdit
 )
 from PyQt6.QtCore import Qt, QSize, QPoint, QPointF, QTimer, QRectF, QUrl, QEvent
 from PyQt6.QtGui import (
@@ -22,9 +23,16 @@ from PyQt6.QtGui import (
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 
-from config import DB_FILE, ALL_MEDIA_EXT, EXT_IMG, EXT_GIF, EXT_VID, EXT_ZIP
-from database import get_file_tags
-from utils import load_media_thumbnail, make_thumbnail_rgb, format_size, show_in_file_manager
+from config import (
+    DB_FILE, ALL_MEDIA_EXT, EXT_IMG, EXT_GIF, EXT_VID, EXT_ZIP,
+    MAX_UGOIRA_FRAME_BYTES, MAX_UGOIRA_TOTAL_BYTES, MAX_UGOIRA_FRAMES,
+    load_app_config, update_app_config
+)
+from database import get_file_tags, is_file_favorite, toggle_file_favorite, add_custom_file_tag
+from utils import (
+    load_media_thumbnail, make_thumbnail_rgb, format_size,
+    show_in_file_manager, safe_single_shot
+)
 
 
 def format_time_ms(ms: int) -> str:
@@ -79,13 +87,6 @@ class ZoomableImageLabel(QWidget):
         self.update()
 
     def _detect_optimal_bg(self, pixmap) -> str:
-        """
-        Analyzes pixmap to decide whether WHITE or DARK background is optimal.
-        - If image is opaque (no transparent pixels): returns 'DARK' (standard dark theme).
-        - If image has transparency:
-            - If visible content has dark lines/ink: returns 'WHITE' (manga/sketch paper style).
-            - If visible content has bright/white lines: returns 'DARK'.
-        """
         if not pixmap or pixmap.isNull() or not pixmap.hasAlphaChannel():
             return 'DARK'
         try:
@@ -137,12 +138,10 @@ class ZoomableImageLabel(QWidget):
         self.orig_pixmap = pixmap
         self._auto_bg = self._detect_optimal_bg(pixmap)
         self.placeholder_text = ""
-        # Maintain user's chosen view mode or default to FIT
         active_mode = self.view_mode if self.view_mode in ('FIT', 'FILL', 'ACTUAL') else 'FIT'
         self.set_view_mode(active_mode)
 
     def update_frame_pixmap(self, pixmap):
-        """Updates the pixmap for animated frames without resetting pan and zoom."""
         if pixmap and not pixmap.isNull():
             self.orig_pixmap = pixmap
             self._auto_bg = self._detect_optimal_bg(pixmap)
@@ -154,12 +153,6 @@ class ZoomableImageLabel(QWidget):
         self.update()
 
     def set_view_mode(self, mode: str):
-        """
-        Sets image scaling mode:
-          'FIT'    - Maintain aspect ratio, entirely visible inside viewport
-          'FILL'   - Maintain aspect ratio, expand to cover viewport without letterboxing
-          'ACTUAL' - 1:1 original pixel mapping (1 image px = 1 screen px)
-        """
         self.view_mode = mode
         if not self.orig_pixmap or self.orig_pixmap.isNull():
             self.update()
@@ -317,7 +310,6 @@ class ZoomableImageLabel(QWidget):
         target_rect = QRectF(draw_x, draw_y, draw_w, draw_h)
         source_rect = QRectF(0.0, 0.0, float(iw), float(ih))
 
-        # Render custom background canvas for transparent / line art images
         has_alpha = bool(self.orig_pixmap and self.orig_pixmap.hasAlphaChannel())
         eff_mode = self._auto_bg if self.bg_mode == 'AUTO' else self.bg_mode
 
@@ -332,7 +324,6 @@ class ZoomableImageLabel(QWidget):
 
         painter.drawPixmap(target_rect, self.orig_pixmap, source_rect)
 
-        # Subtle zoom percentage badge in bottom-left corner when zoomed
         if abs(self.zoom_factor - 1.0) > 0.01:
             zoom_pct = int(self.zoom_factor * 100)
             badge_text = f"🔍 {zoom_pct}%"
@@ -344,7 +335,6 @@ class ZoomableImageLabel(QWidget):
             painter.setPen(QColor("#93c5fd"))
             painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, badge_text)
 
-        # Floating HUD Notification Badge (top-center)
         if self._hud_message:
             painter.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
             fm = painter.fontMetrics()
@@ -399,14 +389,15 @@ class LightboxViewerDialog(MinimizableDialog):
     """
     Fast In-App Media Viewer (Lightbox) with instant keyboard navigation,
     animated GIF/WebP playback, Pixiv Ugoira viewer, full video player,
-    and comprehensive AI tag metadata sidebar.
+    Favorites & Custom Tagging, and comprehensive AI tag metadata sidebar.
     """
     SPEEDS = [0.5, 1.0, 1.5, 2.0]
 
-    def __init__(self, file_paths, current_index=0, parent=None):
+    def __init__(self, file_paths, current_index=0, parent=None, db_file=DB_FILE):
         super().__init__(parent)
         self.file_paths = file_paths or []
         self.current_idx = max(0, min(current_index, len(self.file_paths) - 1)) if self.file_paths else 0
+        self.db_file = db_file or DB_FILE
 
         # Playback & state variables
         self.current_media_type = 'IMAGE'  # 'IMAGE', 'ANIMATION', 'VIDEO'
@@ -527,7 +518,7 @@ class LightboxViewerDialog(MinimizableDialog):
         img_layout.setContentsMargins(0, 0, 0, 0)
         img_layout.setSpacing(0)
 
-        # Top Bar (Filename, Resolution, Counter, Close)
+        # Top Bar (Filename, Resolution, Counter, Favorite, Close)
         top_bar = QWidget()
         top_bar.setStyleSheet("background-color: #121218; padding: 6px 12px; border-bottom: 1px solid #22222e;")
         top_layout = QHBoxLayout(top_bar)
@@ -544,6 +535,13 @@ class LightboxViewerDialog(MinimizableDialog):
         self.lbl_resolution = QLabel("")
         self.lbl_resolution.setStyleSheet("font-size: 12px; color: #9ca3af; margin-right: 12px;")
         top_layout.addWidget(self.lbl_resolution)
+
+        # Favorite Toggle Button
+        self.btn_favorite = QPushButton("☆ Favorite")
+        self.btn_favorite.setProperty("class", "action-btn")
+        self.btn_favorite.setToolTip("Toggle Favorite / Bookmark (Shortcut: S)")
+        self.btn_favorite.clicked.connect(self.toggle_current_favorite)
+        top_layout.addWidget(self.btn_favorite)
 
         btn_toggle_sidebar = QPushButton("🏷️ Tags")
         btn_toggle_sidebar.setProperty("class", "action-btn")
@@ -651,6 +649,7 @@ class LightboxViewerDialog(MinimizableDialog):
         QShortcut(QKeySequence("Escape"), self, self.accept)
         QShortcut(QKeySequence("Space"), self, self.on_space_pressed)
         QShortcut(QKeySequence("F"), self, self.toggle_fullscreen)
+        QShortcut(QKeySequence("S"), self, self.toggle_current_favorite)
         QShortcut(QKeySequence("L"), self, self.toggle_loop)
         QShortcut(QKeySequence("M"), self, self.toggle_mute)
         QShortcut(QKeySequence("K"), self, self.toggle_play_pause)
@@ -689,7 +688,6 @@ class LightboxViewerDialog(MinimizableDialog):
         media_layout.setContentsMargins(6, 4, 6, 4)
         media_layout.setSpacing(10)
 
-        # Play / Pause button
         self.btn_play_pause = QPushButton("⏸")
         self.btn_play_pause.setProperty("class", "action-btn")
         self.btn_play_pause.setToolTip("Play / Pause (Space or K)")
@@ -697,12 +695,10 @@ class LightboxViewerDialog(MinimizableDialog):
         self.btn_play_pause.clicked.connect(self.toggle_play_pause)
         media_layout.addWidget(self.btn_play_pause)
 
-        # Time / Frame indicator
         self.lbl_time = QLabel("00:00 / 00:00")
         self.lbl_time.setStyleSheet("font-size: 12px; font-weight: 600; color: #9ca3af; min-width: 95px; font-family: Consolas, monospace;")
         media_layout.addWidget(self.lbl_time)
 
-        # Progress / Timeline Slider
         self.slider_timeline = QSlider(Qt.Orientation.Horizontal)
         self.slider_timeline.setRange(0, 100)
         self.slider_timeline.setValue(0)
@@ -732,7 +728,6 @@ class LightboxViewerDialog(MinimizableDialog):
         self.slider_timeline.sliderReleased.connect(self.on_timeline_slider_released)
         media_layout.addWidget(self.slider_timeline, 1)
 
-        # Loop Toggle Button
         self.btn_loop = QPushButton("🔁 Loop")
         self.btn_loop.setProperty("class", "action-btn")
         self.btn_loop.setToolTip("Toggle Repeat (L)")
@@ -742,7 +737,6 @@ class LightboxViewerDialog(MinimizableDialog):
         self.btn_loop.clicked.connect(self.toggle_loop)
         media_layout.addWidget(self.btn_loop)
 
-        # Speed Button
         self.btn_speed = QPushButton("1.0x")
         self.btn_speed.setProperty("class", "action-btn")
         self.btn_speed.setToolTip("Playback Speed (0.5x, 1x, 1.5x, 2x)")
@@ -750,7 +744,6 @@ class LightboxViewerDialog(MinimizableDialog):
         self.btn_speed.clicked.connect(self.cycle_speed)
         media_layout.addWidget(self.btn_speed)
 
-        # Volume Container (Volume button + slider, visible for video)
         self.volume_container = QWidget()
         vol_layout = QHBoxLayout(self.volume_container)
         vol_layout.setContentsMargins(0, 0, 0, 0)
@@ -800,12 +793,10 @@ class LightboxViewerDialog(MinimizableDialog):
         sidebar_layout.setContentsMargins(16, 16, 16, 16)
         sidebar_layout.setSpacing(10)
 
-        # Sidebar Title
         lbl_info = QLabel("🏷️ Image & AI Metadata")
         lbl_info.setStyleSheet("font-size: 15px; font-weight: bold; color: #60a5fa;")
         sidebar_layout.addWidget(lbl_info)
 
-        # Rating Badge
         self.lbl_rating_badge = QLabel("RATING: UNKNOWN")
         self.lbl_rating_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_rating_badge.setStyleSheet("""
@@ -818,7 +809,6 @@ class LightboxViewerDialog(MinimizableDialog):
         """)
         sidebar_layout.addWidget(self.lbl_rating_badge)
 
-        # Scrollable metadata area
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         content_w = QWidget()
@@ -826,12 +816,10 @@ class LightboxViewerDialog(MinimizableDialog):
         self.content_layout.setContentsMargins(0, 0, 0, 0)
         self.content_layout.setSpacing(6)
 
-        # Details Section
         self.lbl_filesize = QLabel("Size: -")
         self.lbl_filesize.setStyleSheet("color: #d1d5db; font-size: 12px;")
         self.content_layout.addWidget(self.lbl_filesize)
 
-        # Characters Section
         self.hdr_chars = QLabel("👤 Characters:")
         self.hdr_chars.setProperty("class", "section-hdr")
         self.content_layout.addWidget(self.hdr_chars)
@@ -840,7 +828,6 @@ class LightboxViewerDialog(MinimizableDialog):
         self.lbl_chars.setStyleSheet("color: #93c5fd; font-size: 12px; line-height: 1.4;")
         self.content_layout.addWidget(self.lbl_chars)
 
-        # Series Section
         self.hdr_series = QLabel("📚 Series / Copyright:")
         self.hdr_series.setProperty("class", "section-hdr")
         self.content_layout.addWidget(self.hdr_series)
@@ -849,7 +836,14 @@ class LightboxViewerDialog(MinimizableDialog):
         self.lbl_series.setStyleSheet("color: #c4b5fd; font-size: 12px; line-height: 1.4;")
         self.content_layout.addWidget(self.lbl_series)
 
-        # General Tags Section
+        self.hdr_custom = QLabel("⭐ Custom Tags:")
+        self.hdr_custom.setProperty("class", "section-hdr")
+        self.content_layout.addWidget(self.hdr_custom)
+        self.lbl_custom_tags = QLabel("<i>None</i>")
+        self.lbl_custom_tags.setWordWrap(True)
+        self.lbl_custom_tags.setStyleSheet("color: #fcd34d; font-size: 12px; line-height: 1.4;")
+        self.content_layout.addWidget(self.lbl_custom_tags)
+
         self.hdr_tags = QLabel("🏷️ General Tags:")
         self.hdr_tags.setProperty("class", "section-hdr")
         self.content_layout.addWidget(self.hdr_tags)
@@ -862,6 +856,30 @@ class LightboxViewerDialog(MinimizableDialog):
         scroll.setWidget(content_w)
         sidebar_layout.addWidget(scroll, 1)
 
+        # Add Custom Tag Input Row
+        custom_tag_row = QHBoxLayout()
+        custom_tag_row.setSpacing(6)
+        self.input_custom_tag = QLineEdit()
+        self.input_custom_tag.setPlaceholderText("➕ Add custom tag (e.g. wallpaper)...")
+        self.input_custom_tag.setStyleSheet("""
+            QLineEdit {
+                background-color: #1e1e2a;
+                color: #f3f4f6;
+                border: 1px solid #323244;
+                border-radius: 6px;
+                padding: 5px 8px;
+                font-size: 12px;
+            }
+            QLineEdit:focus { border-color: #3b82f6; }
+        """)
+        self.input_custom_tag.returnPressed.connect(self.on_add_custom_tag)
+        self.btn_add_tag = QPushButton("Add")
+        self.btn_add_tag.setProperty("class", "action-btn")
+        self.btn_add_tag.clicked.connect(self.on_add_custom_tag)
+        custom_tag_row.addWidget(self.input_custom_tag, 1)
+        custom_tag_row.addWidget(self.btn_add_tag)
+        sidebar_layout.addLayout(custom_tag_row)
+
         # Action Buttons
         self.btn_copy_tags = QPushButton("📋 Copy All Tags")
         self.btn_copy_tags.setProperty("class", "action-btn")
@@ -872,6 +890,46 @@ class LightboxViewerDialog(MinimizableDialog):
         self.btn_explorer.setProperty("class", "action-btn")
         self.btn_explorer.clicked.connect(self.open_explorer)
         sidebar_layout.addWidget(self.btn_explorer)
+
+    def toggle_current_favorite(self):
+        """Toggles favorite status for the currently displayed file."""
+        if not self.file_paths or self.current_idx >= len(self.file_paths):
+            return
+        path = self.file_paths[self.current_idx]
+        is_fav = toggle_file_favorite(self.db_file, path)
+        self._update_favorite_button_ui(is_fav)
+        self.img_view.show_hud("⭐ Added to Favorites (is:fav)" if is_fav else "☆ Removed from Favorites")
+
+    def _update_favorite_button_ui(self, is_fav: bool):
+        if not hasattr(self, 'btn_favorite') or not self.btn_favorite:
+            return
+        if is_fav:
+            self.btn_favorite.setText("⭐ Favorited")
+            self.btn_favorite.setStyleSheet("""
+                background-color: #b45309;
+                color: #fef3c7;
+                border: 1px solid #f59e0b;
+                border-radius: 6px;
+                padding: 6px 12px;
+                font-weight: bold;
+                font-size: 12px;
+            """)
+        else:
+            self.btn_favorite.setText("☆ Favorite")
+            self.btn_favorite.setStyleSheet("")
+
+    def on_add_custom_tag(self):
+        """Adds a custom user tag to the current file and refreshes metadata."""
+        if not self.file_paths or self.current_idx >= len(self.file_paths):
+            return
+        raw_tag = self.input_custom_tag.text().strip()
+        if not raw_tag:
+            return
+        path = self.file_paths[self.current_idx]
+        if add_custom_file_tag(self.db_file, path, raw_tag):
+            self.input_custom_tag.clear()
+            self.load_metadata(path)
+            self.img_view.show_hud(f"🏷️ Added tag: {raw_tag}")
 
     def stop_all_playback(self):
         """Immediately stops all audio, video, movie, and timer playback."""
@@ -923,10 +981,8 @@ class LightboxViewerDialog(MinimizableDialog):
         filename = os.path.basename(path)
         ext = os.path.splitext(path)[1].lower()
 
-        # Update Top Bar Counter
         self.lbl_counter.setText(f"{self.current_idx + 1} / {len(self.file_paths)}")
 
-        # Reset Media Controls UI State
         self.slider_timeline.blockSignals(True)
         self.slider_timeline.setRange(0, 100)
         self.slider_timeline.setValue(0)
@@ -935,13 +991,10 @@ class LightboxViewerDialog(MinimizableDialog):
         self.lbl_time.setText("00:00 / 00:00")
         self.btn_speed.setText(f"{self.SPEEDS[self.speed_idx]}x")
 
-        # ----------------------------------------------------
-        # 1. VIDEO FILES (.mp4, .webm, .mkv, .mov, .avi)
-        # ----------------------------------------------------
         if ext in EXT_VID:
             self.current_media_type = 'VIDEO'
             self.lbl_filename.setText(f"🎬 {filename}")
-            self.display_stack.setCurrentIndex(1)  # Video widget
+            self.display_stack.setCurrentIndex(1)
             self.media_bar.setVisible(True)
             self.volume_container.setVisible(True)
 
@@ -957,7 +1010,6 @@ class LightboxViewerDialog(MinimizableDialog):
             self.current_video_res = f"{vw} × {vh}" if vw > 0 and vh > 0 else "Video"
             self.lbl_resolution.setText(self.current_video_res)
 
-            # Start playback with QMediaPlayer
             try:
                 self.media_player.setSource(QUrl.fromLocalFile(os.path.abspath(path)))
                 self.media_player.setLoops(QMediaPlayer.Loops.Infinite if self.is_looping else 1)
@@ -967,13 +1019,10 @@ class LightboxViewerDialog(MinimizableDialog):
                 logging.error(f"Error starting video playback: {e}")
                 self.start_cv2_video_playback(path)
 
-        # ----------------------------------------------------
-        # 2. ANIMATED GIF (.gif)
-        # ----------------------------------------------------
         elif ext in EXT_GIF:
             self.current_media_type = 'ANIMATION'
             self.lbl_filename.setText(f"🎞️ {filename}")
-            self.display_stack.setCurrentIndex(0)  # Zoomable image label
+            self.display_stack.setCurrentIndex(0)
             self.media_bar.setVisible(True)
             self.volume_container.setVisible(False)
 
@@ -1007,9 +1056,6 @@ class LightboxViewerDialog(MinimizableDialog):
                     self.img_view.setText("Cannot preview GIF")
                 self.media_bar.setVisible(False)
 
-        # ----------------------------------------------------
-        # 3. PIXIV UGOIRA / ZIP ARCHIVES (.zip, .ugoira)
-        # ----------------------------------------------------
         elif ext in EXT_ZIP:
             frames = self.load_ugoira_frames(path)
             if frames and len(frames) > 1:
@@ -1035,7 +1081,6 @@ class LightboxViewerDialog(MinimizableDialog):
                 self.img_view.set_image(frames[0][0])
                 self.lbl_resolution.setText(f"{frames[0][0].width()} × {frames[0][0].height()}")
             else:
-                # Fallback to thumbnail generator
                 self.current_media_type = 'IMAGE'
                 self.lbl_filename.setText(f"📦 {filename}")
                 self.display_stack.setCurrentIndex(0)
@@ -1053,9 +1098,6 @@ class LightboxViewerDialog(MinimizableDialog):
                     self.lbl_resolution.setText("Unknown")
                     self.img_view.setText("Cannot preview archive")
 
-        # ----------------------------------------------------
-        # 4. WEBP (CAN BE ANIMATED OR STATIC)
-        # ----------------------------------------------------
         elif ext == '.webp':
             is_animated = False
             try:
@@ -1108,9 +1150,6 @@ class LightboxViewerDialog(MinimizableDialog):
                 else:
                     self.img_view.setText("Cannot preview file")
 
-        # ----------------------------------------------------
-        # 5. STATIC IMAGES (PNG, JPG, JPEG, BMP, ICO)
-        # ----------------------------------------------------
         else:
             self.current_media_type = 'IMAGE'
             self.lbl_filename.setText(f"🖼️ {filename}")
@@ -1135,18 +1174,16 @@ class LightboxViewerDialog(MinimizableDialog):
                     self.lbl_resolution.setText("Unknown Resolution")
                     self.img_view.setText("Cannot preview file")
 
-        # Update File Size
         try:
             sz = os.path.getsize(path)
             self.lbl_filesize.setText(f"File Size: <b>{format_size(sz)}</b>")
         except Exception:
             self.lbl_filesize.setText("File Size: Unknown")
 
-        # Load AI Tags & Rating
         self.load_metadata(path)
 
     def load_ugoira_frames(self, zip_path):
-        """Extracts and parses animation frames and delay metadata from Pixiv Ugoira archives."""
+        """Extracts and parses animation frames and delay metadata from Pixiv Ugoira archives with Zip Bomb protection."""
         import zipfile
         import json
         try:
@@ -1156,10 +1193,12 @@ class LightboxViewerDialog(MinimizableDialog):
                 for meta_name in ['animation.json', 'ugoira.json']:
                     if meta_name in names:
                         try:
-                            meta = json.loads(z.read(meta_name).decode('utf-8'))
-                            for item in meta.get('frames', []):
-                                if 'file' in item:
-                                    frame_delays[item['file']] = item.get('delay', 100)
+                            info = z.getinfo(meta_name)
+                            if info.file_size <= 5 * 1024 * 1024:
+                                meta = json.loads(z.read(meta_name).decode('utf-8'))
+                                for item in meta.get('frames', []):
+                                    if 'file' in item:
+                                        frame_delays[item['file']] = item.get('delay', 100)
                         except Exception:
                             pass
                         break
@@ -1169,12 +1208,22 @@ class LightboxViewerDialog(MinimizableDialog):
                     if os.path.splitext(f)[1].lower() in EXT_IMG
                     and not os.path.basename(f).startswith('.')
                     and not f.startswith('__MACOSX')
-                ])
+                ])[:MAX_UGOIRA_FRAMES]
                 if not img_names:
                     return []
 
                 frames = []
+                total_bytes = 0
                 for f in img_names:
+                    try:
+                        zinfo = z.getinfo(f)
+                        if zinfo.file_size > MAX_UGOIRA_FRAME_BYTES:
+                            continue
+                        total_bytes += zinfo.file_size
+                        if total_bytes > MAX_UGOIRA_TOTAL_BYTES:
+                            break
+                    except KeyError:
+                        continue
                     data = z.read(f)
                     qimg = QImage.fromData(data)
                     if not qimg.isNull():
@@ -1187,7 +1236,6 @@ class LightboxViewerDialog(MinimizableDialog):
             return []
 
     def start_ugoira_timer(self, delay_ms):
-        """Starts frame-by-frame timer for Pixiv Ugoira animation."""
         if not self.ugoira_frames:
             return
         if not self.ugoira_timer:
@@ -1199,7 +1247,6 @@ class LightboxViewerDialog(MinimizableDialog):
         self.ugoira_timer.start(interval)
 
     def on_ugoira_tick(self):
-        """Handles frame advancement for Ugoira animation."""
         if not self.ugoira_frames or self.current_media_type != 'ANIMATION':
             return
         next_idx = self.ugoira_idx + 1
@@ -1219,7 +1266,6 @@ class LightboxViewerDialog(MinimizableDialog):
         self.start_ugoira_timer(delay)
 
     def on_movie_frame_changed(self, frame_num):
-        """Called when QMovie advances a frame in GIF or animated WebP."""
         if not self.current_movie or self.current_media_type != 'ANIMATION':
             return
         pix = self.current_movie.currentPixmap()
@@ -1239,7 +1285,6 @@ class LightboxViewerDialog(MinimizableDialog):
             self.lbl_time.setText(f"Frame {frame_num + 1}")
 
     def on_player_position_changed(self, pos_ms):
-        """Updates timeline slider and time label during video playback."""
         if self.current_media_type != 'VIDEO':
             return
         if not self.slider_timeline.isSliderDown():
@@ -1250,7 +1295,6 @@ class LightboxViewerDialog(MinimizableDialog):
         self.lbl_time.setText(f"{format_time_ms(pos_ms)} / {format_time_ms(dur_ms)}")
 
     def on_player_duration_changed(self, dur_ms):
-        """Sets timeline slider range and updates duration."""
         if self.current_media_type != 'VIDEO':
             return
         if dur_ms > 0:
@@ -1261,7 +1305,6 @@ class LightboxViewerDialog(MinimizableDialog):
                 self.lbl_resolution.setText(f"{self.current_video_res} • {format_time_ms(dur_ms)}")
 
     def on_player_playback_state_changed(self, state):
-        """Updates play/pause button icon."""
         if self.current_media_type != 'VIDEO':
             return
         if state == QMediaPlayer.PlaybackState.PlayingState:
@@ -1270,7 +1313,6 @@ class LightboxViewerDialog(MinimizableDialog):
             self.btn_play_pause.setText("▶")
 
     def on_player_media_status_changed(self, status):
-        """Handles loop repeat when video reaches the end."""
         if self.current_media_type != 'VIDEO':
             return
         if status == QMediaPlayer.MediaStatus.EndOfMedia:
@@ -1281,13 +1323,11 @@ class LightboxViewerDialog(MinimizableDialog):
                 self.btn_play_pause.setText("▶")
 
     def on_player_error(self, error, error_string):
-        """Catches video decode errors and falls back to OpenCV player."""
         logging.warning(f"QMediaPlayer error: {error_string} ({error}), attempting OpenCV fallback...")
         if self.file_paths and self.current_idx < len(self.file_paths):
             self.start_cv2_video_playback(self.file_paths[self.current_idx])
 
     def start_cv2_video_playback(self, path):
-        """Robust fallback video player using OpenCV decoding directly onto canvas."""
         if not cv2:
             return
         try:
@@ -1303,7 +1343,7 @@ class LightboxViewerDialog(MinimizableDialog):
             self.cv2_curr_frame = 0
 
             self.current_media_type = 'VIDEO'
-            self.display_stack.setCurrentIndex(0)  # Use ZoomableImageLabel for cv2 frames
+            self.display_stack.setCurrentIndex(0)
             self.media_bar.setVisible(True)
             self.volume_container.setVisible(False)
 
@@ -1330,7 +1370,6 @@ class LightboxViewerDialog(MinimizableDialog):
             logging.error(f"Error in cv2 fallback: {e}")
 
     def on_cv2_tick(self):
-        """Advances video frame using OpenCV."""
         if not self.cv2_cap or not self.cv2_cap.isOpened():
             return
         ret, frame = self.cv2_cap.read()
@@ -1360,7 +1399,6 @@ class LightboxViewerDialog(MinimizableDialog):
         self.lbl_time.setText(f"{format_time_ms(int(curr_sec * 1000))} / {format_time_ms(int(dur_sec * 1000))}")
 
     def on_timeline_slider_moved(self, val):
-        """Displays target position/frame in time label while dragging timeline."""
         if self.current_media_type == 'VIDEO':
             if hasattr(self, 'cv2_timer') and self.cv2_cap:
                 dur_sec = (self.cv2_total_frames / self.cv2_fps) if self.cv2_fps > 0 else 0
@@ -1377,7 +1415,6 @@ class LightboxViewerDialog(MinimizableDialog):
                 self.lbl_time.setText(f"Frame {val + 1} / {len(self.ugoira_frames)}")
 
     def on_timeline_slider_released(self):
-        """Seeks to the selected position/frame when user finishes dragging timeline."""
         val = self.slider_timeline.value()
         if self.current_media_type == 'VIDEO':
             if hasattr(self, 'cv2_timer') and self.cv2_cap:
@@ -1402,7 +1439,6 @@ class LightboxViewerDialog(MinimizableDialog):
                 self.img_view.update_frame_pixmap(self.ugoira_frames[self.ugoira_idx][0])
 
     def toggle_play_pause(self):
-        """Toggles play and pause across video, GIF, WebP, and Ugoira."""
         if self.current_media_type == 'VIDEO':
             if hasattr(self, 'cv2_timer') and self.cv2_timer:
                 if self.cv2_timer.isActive():
@@ -1439,14 +1475,12 @@ class LightboxViewerDialog(MinimizableDialog):
                     self.btn_play_pause.setText("⏸")
 
     def on_space_pressed(self):
-        """Spacebar pauses/plays animations and videos, or moves to next image if static."""
         if self.current_media_type in ('VIDEO', 'ANIMATION'):
             self.toggle_play_pause()
         else:
             self.show_next_image()
 
     def toggle_loop(self):
-        """Toggles repeat/loop mode for media."""
         self.is_looping = not self.is_looping
         self.btn_loop.setChecked(self.is_looping)
         if self.is_looping:
@@ -1458,7 +1492,6 @@ class LightboxViewerDialog(MinimizableDialog):
             self.media_player.setLoops(QMediaPlayer.Loops.Infinite if self.is_looping else 1)
 
     def cycle_speed(self):
-        """Cycles playback speed (0.5x, 1.0x, 1.5x, 2.0x)."""
         self.speed_idx = (self.speed_idx + 1) % len(self.SPEEDS)
         speed = self.SPEEDS[self.speed_idx]
         self.btn_speed.setText(f"{speed}x")
@@ -1477,26 +1510,22 @@ class LightboxViewerDialog(MinimizableDialog):
                 self.ugoira_timer.setInterval(max(10, int(delay / speed)))
 
     def toggle_mute(self):
-        """Toggles audio mute."""
         if hasattr(self, 'audio_output') and self.audio_output:
             new_muted = not self.audio_output.isMuted()
             self.audio_output.setMuted(new_muted)
             self.update_volume_ui()
 
     def volume_up(self):
-        """Increases volume by 5%."""
         if self.current_media_type == 'VIDEO':
             val = min(100, self.slider_volume.value() + 5)
             self.slider_volume.setValue(val)
 
     def volume_down(self):
-        """Decreases volume by 5%."""
         if self.current_media_type == 'VIDEO':
             val = max(0, self.slider_volume.value() - 5)
             self.slider_volume.setValue(val)
 
     def on_volume_slider_changed(self, val):
-        """Adjusts audio output volume."""
         if hasattr(self, 'audio_output') and self.audio_output:
             if self.audio_output.isMuted() and val > 0:
                 self.audio_output.setMuted(False)
@@ -1504,7 +1533,6 @@ class LightboxViewerDialog(MinimizableDialog):
             self.update_volume_ui()
 
     def update_volume_ui(self):
-        """Reflects current audio volume and mute state in UI buttons."""
         if not hasattr(self, 'audio_output') or not self.audio_output:
             return
         is_muted = self.audio_output.isMuted()
@@ -1520,18 +1548,27 @@ class LightboxViewerDialog(MinimizableDialog):
             self.btn_mute.setToolTip("Mute (M)")
 
     def load_metadata(self, path):
-        """Fetches AI tags, character, and series metadata from SQLite database."""
-        tags_info = get_file_tags(DB_FILE, path)
+        """Fetches AI tags, character, series, favorite, and custom tag metadata from SQLite database."""
+        tags_info = get_file_tags(self.db_file, path)
+        is_fav = bool(tags_info.get('is_favorite')) if tags_info else is_file_favorite(self.db_file, path)
+        self._update_favorite_button_ui(is_fav)
+
+        custom_list = tags_info.get('custom', []) if tags_info else []
+        if hasattr(self, 'lbl_custom_tags'):
+            if custom_list:
+                self.lbl_custom_tags.setText(", ".join([f"<b>#{html.escape(str(c[0]))}</b>" for c in custom_list]))
+            else:
+                self.lbl_custom_tags.setText("<i>None</i>")
+
         if not tags_info or not tags_info.get('all'):
             self.lbl_rating_badge.setText("⚪ NOT SCANNED")
             self.lbl_rating_badge.setStyleSheet("background-color: #1f2937; color: #9ca3af; border-radius: 6px; padding: 6px; font-weight: bold;")
             self.lbl_chars.setText("<i>No AI tags found for this file.</i>")
             self.lbl_series.setText("<i>None</i>")
             self.lbl_tags.setText("<i>None</i>")
-            self.current_tags = []
+            self.current_tags = [c[0] for c in custom_list]
             return
 
-        # Rating
         rating = tags_info.get('rating', 'unknown')
         if rating == 'general':
             self.lbl_rating_badge.setText("🟢 SFW / GENERAL (ปลอดภัย)")
@@ -1543,44 +1580,39 @@ class LightboxViewerDialog(MinimizableDialog):
             self.lbl_rating_badge.setText("🔞 NSFW / EXPLICIT (18+)")
             self.lbl_rating_badge.setStyleSheet("background-color: #7f1d1d; color: #f87171; border-radius: 6px; padding: 6px; font-weight: bold;")
         else:
-            self.lbl_rating_badge.setText(f"⚪ RATING: {rating.upper()}")
+            self.lbl_rating_badge.setText(f"⚪ RATING: {html.escape(str(rating).upper())}")
             self.lbl_rating_badge.setStyleSheet("background-color: #1f2937; color: #9ca3af; border-radius: 6px; padding: 6px; font-weight: bold;")
 
-        # Characters
         chars = tags_info.get('characters', [])
         if chars:
-            c_lines = [f"• <b>{c[0].replace('_', ' ').title()}</b> ({int(c[1]*100)}%)" for c in chars]
+            c_lines = [f"• <b>{html.escape(c[0].replace('_', ' ').title())}</b> ({int(c[1]*100)}%)" for c in chars]
             self.lbl_chars.setText("<br>".join(c_lines))
         else:
             self.lbl_chars.setText("<i>None detected</i>")
 
-        # Series
         series = tags_info.get('series', [])
         if series:
-            s_lines = [f"• <b>{s[0].replace('_', ' ').title()}</b> ({int(s[1]*100)}%)" for s in series]
+            s_lines = [f"• <b>{html.escape(s[0].replace('_', ' ').title())}</b> ({int(s[1]*100)}%)" for s in series]
             self.lbl_series.setText("<br>".join(s_lines))
         else:
             self.lbl_series.setText("<i>None detected</i>")
 
-        # General Tags
         gen = tags_info.get('general', [])
         if gen:
-            gen_names = [f"{g[0]} ({int(g[1]*100)}%)" for g in gen[:40]]
+            gen_names = [f"{html.escape(str(g[0]))} ({int(g[1]*100)}%)" for g in gen[:40]]
             self.lbl_tags.setText(", ".join(gen_names))
         else:
             self.lbl_tags.setText("<i>None</i>")
 
-        self.current_tags = [t[0] for t in tags_info.get('all', []) if t[0] != '__none__']
+        self.current_tags = [t[0] for t in tags_info.get('all', []) if t[0] not in ('__none__', 'favorite')]
 
     def show_prev_image(self):
-        """Navigates to previous media item."""
         if self.current_idx > 0:
             self.stop_all_playback()
             self.current_idx -= 1
             self.update_current_display()
 
     def show_next_image(self):
-        """Navigates to next media item."""
         if self.current_idx < len(self.file_paths) - 1:
             self.stop_all_playback()
             self.current_idx += 1
@@ -1589,35 +1621,22 @@ class LightboxViewerDialog(MinimizableDialog):
     def load_saved_bg_mode(self) -> str:
         """Loads saved background mode preference from config.json."""
         try:
-            import json
-            from config import CONFIG_FILE
-            if os.path.exists(CONFIG_FILE):
-                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                    cfg = json.load(f)
-                    val = cfg.get('lightbox_bg_mode', 'AUTO')
-                    if val in ('AUTO', 'WHITE', 'DARK'):
-                        return val
+            cfg = load_app_config()
+            val = cfg.get('lightbox_bg_mode', 'AUTO')
+            if val in ('AUTO', 'WHITE', 'DARK'):
+                return val
         except Exception:
             pass
         return 'AUTO'
 
     def save_bg_mode(self, mode: str):
-        """Saves background mode preference to config.json."""
+        """Saves background mode preference to config.json atomically."""
         try:
-            import json
-            from config import CONFIG_FILE
-            cfg = {}
-            if os.path.exists(CONFIG_FILE):
-                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                    cfg = json.load(f)
-            cfg['lightbox_bg_mode'] = mode
-            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-                json.dump(cfg, f, indent=4)
+            update_app_config({'lightbox_bg_mode': mode})
         except Exception as e:
             logging.error(f"Error saving lightbox_bg_mode: {e}")
 
     def on_bg_mode_selected(self, index: int):
-        """Handles background canvas mode dropdown change."""
         mode = self.combo_bg.itemData(index)
         if mode:
             self.img_view.set_bg_mode(mode)
@@ -1631,7 +1650,6 @@ class LightboxViewerDialog(MinimizableDialog):
             self.save_bg_mode(mode)
 
     def cycle_background_mode(self):
-        """Keyboard shortcut (B) handler to cycle through background canvas modes."""
         next_mode = self.img_view.cycle_bg_mode()
         idx = self.combo_bg.findData(next_mode)
         if idx >= 0:
@@ -1648,11 +1666,9 @@ class LightboxViewerDialog(MinimizableDialog):
         self.save_bg_mode(next_mode)
 
     def toggle_sidebar(self):
-        """Shows/hides AI tag sidebar."""
         self.sidebar_frame.setVisible(not self.sidebar_frame.isVisible())
 
     def on_scale_mode_selected(self, index):
-        """Handles view mode combobox change."""
         if index < 0 or index >= self.combo_scale.count():
             return
         mode = self.combo_scale.itemData(index)
@@ -1664,7 +1680,6 @@ class LightboxViewerDialog(MinimizableDialog):
             self.set_scale_mode(mode)
 
     def set_scale_mode(self, mode: str):
-        """Sets scale mode for both image canvas and video widget."""
         self.img_view.set_view_mode(mode)
         if hasattr(self, 'video_widget') and self.video_widget:
             if mode == 'FILL':
@@ -1673,7 +1688,6 @@ class LightboxViewerDialog(MinimizableDialog):
                 self.video_widget.setAspectRatioMode(Qt.AspectRatioMode.KeepAspectRatio)
 
     def on_zoom_changed(self, zoom_factor, view_mode='CUSTOM'):
-        """Synchronizes combo scale dropdown with zoom level."""
         self.combo_scale.blockSignals(True)
         if view_mode == 'FIT':
             if self.combo_scale.count() > 3:
@@ -1698,7 +1712,6 @@ class LightboxViewerDialog(MinimizableDialog):
         self.combo_scale.blockSignals(False)
 
     def toggle_zoom(self):
-        """Toggles between FIT, FILL, and ACTUAL view modes."""
         current = self.img_view.view_mode
         if current == 'FIT':
             self.set_scale_mode('FILL')
@@ -1708,7 +1721,6 @@ class LightboxViewerDialog(MinimizableDialog):
             self.set_scale_mode('FIT')
 
     def toggle_fullscreen(self):
-        """Toggles window fullscreen mode."""
         if self.isFullScreen():
             self.showNormal()
         else:
@@ -1720,7 +1732,7 @@ class LightboxViewerDialog(MinimizableDialog):
             tag_str = ", ".join(self.current_tags)
             QApplication.clipboard().setText(tag_str)
             self.btn_copy_tags.setText("✅ Copied!")
-            QTimer.singleShot(1500, lambda: self.btn_copy_tags.setText("📋 Copy All Tags"))
+            safe_single_shot(1500, self.btn_copy_tags, lambda: self.btn_copy_tags.setText("📋 Copy All Tags"))
 
     def open_explorer(self):
         """Selects current file in Windows File Explorer or native file manager."""
@@ -1729,19 +1741,16 @@ class LightboxViewerDialog(MinimizableDialog):
             if show_in_file_manager(p):
                 if hasattr(self, 'btn_explorer') and self.btn_explorer:
                     self.btn_explorer.setText("📂 Opening...")
-                    QTimer.singleShot(1200, lambda: self.btn_explorer.setText("📂 Open in Explorer"))
+                    safe_single_shot(1200, self.btn_explorer, lambda: self.btn_explorer.setText("📂 Open in Explorer"))
 
     def closeEvent(self, event):
-        """Ensures all video, audio, and animations stop when window is closed."""
         self.stop_all_playback()
         super().closeEvent(event)
 
     def accept(self):
-        """Ensures playback stops on dialog accept."""
         self.stop_all_playback()
         super().accept()
 
     def reject(self):
-        """Ensures playback stops on dialog reject."""
         self.stop_all_playback()
         super().reject()

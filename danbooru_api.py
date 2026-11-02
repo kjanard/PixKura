@@ -9,7 +9,7 @@ from typing import Optional, Dict, Any, List
 import requests
 from requests.auth import HTTPBasicAuth
 
-from config import AppConfig, CONFIG_FILE
+from config import AppConfig, CONFIG_FILE, load_app_config, decrypt_secret
 
 logger = logging.getLogger("PixKura.DanbooruClient")
 
@@ -46,28 +46,26 @@ class DanbooruClient:
     def _load_credentials(self):
         """
         Loads Danbooru API credentials from:
-        1. Local test_pixiv config.json ('danbooru_username', 'danbooru_api_key')
+        1. Local test_pixiv config.json ('danbooru_username', 'danbooru_api_key', with DPAPI decryption)
         2. DanbuDownloader config.json ('api_username', 'api_key') if available
         """
         try:
-            # 1. Try local config.json
-            if os.path.exists(CONFIG_FILE):
-                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                    cfg = json.load(f)
-                    u = cfg.get("danbooru_username", "").strip()
-                    k = cfg.get("danbooru_api_key", "").strip()
-                    if u:
-                        self.username = u
-                        self.api_key = k
-                        return
+            # 1. Try local config.json via thread-safe DPAPI-aware loader
+            cfg = load_app_config(CONFIG_FILE)
+            u = str(cfg.get("danbooru_username", "")).strip()
+            k = str(cfg.get("danbooru_api_key", "")).strip()
+            if u:
+                self.username = u
+                self.api_key = k
+                return
 
             # 2. Try sibling DanbuDownloader project config.json
             danbudl_cfg = Path(__file__).resolve().parent.parent / "DanbuDownloader" / "config.json"
             if danbudl_cfg.exists():
                 with open(danbudl_cfg, "r", encoding="utf-8") as f:
                     cfg = json.load(f)
-                    u = cfg.get("api_username", "").strip()
-                    k = cfg.get("api_key", "").strip()
+                    u = str(cfg.get("api_username", "")).strip()
+                    k = decrypt_secret(str(cfg.get("api_key", "")).strip())
                     if u:
                         self.username = u
                         self.api_key = k
@@ -77,7 +75,7 @@ class DanbooruClient:
 
     def _update_session_auth_and_headers(self):
         """Configure User-Agent and Basic Auth according to Danbooru specifications."""
-        version = getattr(AppConfig, "VERSION", "2.3.3")
+        version = getattr(AppConfig, "VERSION", "2.4.0")
         if self.username:
             user_agent = f"PixKura/{version} (DanbuDL-Engine; user: {self.username}; +https://danbooru.donmai.us/)"
         else:
