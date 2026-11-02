@@ -51,6 +51,8 @@ NSFW_EXPLICIT_TAGS = (
     'anus', 'anal', 'fingering', 'lactation', 'cameltoe', 'erection'
 )
 
+NSFW_ALL_FILTER_TAGS = NSFW_EXPLICIT_TAGS + ('questionable',)
+
 SENSITIVE_ECCHI_TAGS = (
     'sensitive', 'cleavage', 'bikini', 'swimsuit', 'panties', 'underwear',
     'lingerie', 'bra', 'sideboob', 'underboob', 'thong', 'ass', 'crotch'
@@ -416,31 +418,32 @@ def resolve_matching_paths(conn, query, active_rating='ALL', active_char=None):
     if effective_rating and effective_rating != 'ALL':
         try:
             if effective_rating == 'SFW':
-                # SFW: Must NOT have any explicit NSFW tags or category 5/9 explicit/questionable
-                nsfw_placeholders = ','.join(['?'] * len(NSFW_EXPLICIT_TAGS))
+                # SFW: Must NOT have any explicit NSFW tags or questionable/explicit rating
+                nsfw_placeholders = ','.join(['?'] * len(NSFW_ALL_FILTER_TAGS))
                 cursor.execute(f"""
                     SELECT DISTINCT path FROM file_tags 
-                    WHERE (category IN (5, 9) AND tag_name IN ('questionable', 'explicit'))
-                       OR (tag_name IN ({nsfw_placeholders}))
-                """, NSFW_EXPLICIT_TAGS)
+                    WHERE tag_name IN ({nsfw_placeholders})
+                """, NSFW_ALL_FILTER_TAGS)
                 nsfw_set = {r[0] for r in cursor.fetchall()}
 
                 if matched_paths is not None:
                     matched_paths = matched_paths - nsfw_set
                 else:
-                    # Get all scanned paths minus NSFW
-                    cursor.execute("SELECT DISTINCT path FROM file_tags WHERE category != 10")
+                    # Get all scanned paths minus NSFW using fast index semi-join
+                    cursor.execute("SELECT path FROM file_index f WHERE EXISTS (SELECT 1 FROM file_tags t WHERE t.path = f.path AND t.category != 10)")
                     all_scanned = {r[0] for r in cursor.fetchall()}
+                    if not all_scanned:
+                        cursor.execute("SELECT DISTINCT path FROM file_tags WHERE category != 10")
+                        all_scanned = {r[0] for r in cursor.fetchall()}
                     matched_paths = all_scanned - nsfw_set
 
             elif effective_rating == 'NSFW':
                 # NSFW: Has explicit/questionable rating or any explicit NSFW tags
-                nsfw_placeholders = ','.join(['?'] * len(NSFW_EXPLICIT_TAGS))
+                nsfw_placeholders = ','.join(['?'] * len(NSFW_ALL_FILTER_TAGS))
                 cursor.execute(f"""
                     SELECT DISTINCT path FROM file_tags 
-                    WHERE (category IN (5, 9) AND tag_name IN ('questionable', 'explicit'))
-                       OR (tag_name IN ({nsfw_placeholders}))
-                """, NSFW_EXPLICIT_TAGS)
+                    WHERE tag_name IN ({nsfw_placeholders})
+                """, NSFW_ALL_FILTER_TAGS)
                 nsfw_paths = {r[0] for r in cursor.fetchall()}
                 matched_paths = nsfw_paths if matched_paths is None else (matched_paths & nsfw_paths)
 
@@ -449,8 +452,7 @@ def resolve_matching_paths(conn, query, active_rating='ALL', active_char=None):
                 sens_placeholders = ','.join(['?'] * len(SENSITIVE_ECCHI_TAGS))
                 cursor.execute(f"""
                     SELECT DISTINCT path FROM file_tags 
-                    WHERE (category IN (5, 9) AND tag_name = 'sensitive')
-                       OR (tag_name IN ({sens_placeholders}))
+                    WHERE tag_name IN ({sens_placeholders})
                 """, SENSITIVE_ECCHI_TAGS)
                 sens_paths = {r[0] for r in cursor.fetchall()}
                 matched_paths = sens_paths if matched_paths is None else (matched_paths & sens_paths)
@@ -474,8 +476,11 @@ def resolve_matching_paths(conn, query, active_rating='ALL', active_char=None):
             if matched_paths is not None:
                 matched_paths = matched_paths - excluded_paths
             else:
-                cursor.execute("SELECT DISTINCT path FROM file_tags WHERE category != 10")
+                cursor.execute("SELECT path FROM file_index f WHERE EXISTS (SELECT 1 FROM file_tags t WHERE t.path = f.path AND t.category != 10)")
                 all_scanned = {r[0] for r in cursor.fetchall()}
+                if not all_scanned:
+                    cursor.execute("SELECT DISTINCT path FROM file_tags WHERE category != 10")
+                    all_scanned = {r[0] for r in cursor.fetchall()}
                 matched_paths = all_scanned - excluded_paths
         except Exception as e:
             logging.error(f"Error excluding tags: {e}")

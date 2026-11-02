@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
     QProgressBar, QCheckBox, QComboBox, QFileDialog, QSlider, QListWidget,
     QGroupBox, QAbstractItemView
 )
-from PyQt6.QtCore import Qt, QUrl, QTimer, QRectF, QEvent, QThreadPool
+from PyQt6.QtCore import Qt, QUrl, QTimer, QRectF, QEvent, QThreadPool, QThread, pyqtSignal
 from PyQt6.QtGui import QDesktopServices, QPainter, QColor
 
 from config import AppConfig, DB_FILE
@@ -383,6 +383,70 @@ class SearchHelpDialog(MinimizableDialog):
             QApplication.clipboard().setText(query)
 
 
+class _DatasetCountWorker(QThread):
+    """
+    Background worker that resolves tagged candidate files and NSFW paths
+    without blocking the GUI thread or calling os.path.exists() 268k+ times.
+    """
+    finished = pyqtSignal(list, set)
+
+    def __init__(self, db_file, initial_paths=None):
+        super().__init__()
+        self.db_file = db_file
+        self.initial_paths = list(initial_paths or [])
+        self._conn = None
+        self._is_cancelled = False
+
+    def stop(self):
+        self._is_cancelled = True
+        c = self._conn
+        if c is not None:
+            try:
+                c.interrupt()
+            except Exception:
+                pass
+
+    def run(self):
+        from query_parser import NSFW_ALL_FILTER_TAGS
+        candidates = []
+        nsfw_set = set()
+        try:
+            conn = sqlite3.connect(self.db_file, timeout=10.0)
+            self._conn = conn
+            cursor = conn.cursor()
+
+            if self.initial_paths:
+                candidates = self.initial_paths
+            else:
+                # Fast index semi-join on file_index + idx_file_tags_path instead of 7.7M-row scan
+                cursor.execute(
+                    "SELECT path FROM file_index f WHERE EXISTS ("
+                    "SELECT 1 FROM file_tags t WHERE t.path = f.path AND t.tag_name != '__none__' AND t.category != 99)"
+                )
+                candidates = [r[0] for r in cursor.fetchall()]
+                if not candidates and not self._is_cancelled:
+                    cursor.execute("SELECT DISTINCT path FROM file_tags WHERE tag_name != '__none__' AND category != 99")
+                    candidates = [r[0] for r in cursor.fetchall()]
+
+            if not self._is_cancelled and candidates:
+                nsfw_placeholders = ','.join(['?'] * len(NSFW_ALL_FILTER_TAGS))
+                cursor.execute(
+                    f"SELECT DISTINCT path FROM file_tags WHERE tag_name IN ({nsfw_placeholders})",
+                    NSFW_ALL_FILTER_TAGS
+                )
+                nsfw_set = {r[0] for r in cursor.fetchall()}
+
+            self._conn = None
+            conn.close()
+        except Exception:
+            self._conn = None
+            if not candidates:
+                candidates = list(self.initial_paths)
+
+        if not self._is_cancelled:
+            self.finished.emit(candidates, nsfw_set)
+
+
 class DatasetExporterDialog(MinimizableDialog):
     """
     One-Click Dataset Exporter for Kohya_ss / Stable Diffusion LoRA / Colab training.
@@ -504,31 +568,81 @@ class DatasetExporterDialog(MinimizableDialog):
         btn_row.addWidget(btn_close)
         layout.addLayout(btn_row)
 
+        self._all_candidates = []
+        self._nsfw_set = set()
         self._resolved_paths = []
-        self._update_target_count()
+        self._candidates_loaded = False
+        self._count_worker = None
+
+        if 1 <= len(self.initial_file_paths) <= 500:
+            self._resolve_small_batch_sync()
+        else:
+            self.lbl_count.setText("⏳ กำลังคำนวณจำนวนไฟล์ที่พร้อมส่งออก...")
+            QTimer.singleShot(0, self._start_async_count)
+
+    def _resolve_small_batch_sync(self):
+        """Fast (< 2 ms) indexed lookup when exporting a specific folder or small selection."""
+        from query_parser import NSFW_ALL_FILTER_TAGS
+        self._all_candidates = list(self.initial_file_paths)
+        try:
+            conn = sqlite3.connect(self.db_file, timeout=5.0)
+            cursor = conn.cursor()
+            path_ph = ','.join(['?'] * len(self._all_candidates))
+            nsfw_ph = ','.join(['?'] * len(NSFW_ALL_FILTER_TAGS))
+            cursor.execute(
+                f"SELECT DISTINCT path FROM file_tags WHERE path IN ({path_ph}) AND tag_name IN ({nsfw_ph})",
+                tuple(self._all_candidates) + tuple(NSFW_ALL_FILTER_TAGS)
+            )
+            self._nsfw_set = {r[0] for r in cursor.fetchall()}
+            conn.close()
+        except Exception:
+            self._nsfw_set = set()
+        self._candidates_loaded = True
+        self._apply_filter_from_cache()
+
+    def _start_async_count(self):
+        if self._candidates_loaded or not self.isVisible() and self._count_worker is not None:
+            return
+        self._stop_count_worker()
+        self._count_worker = _DatasetCountWorker(self.db_file, self.initial_file_paths)
+        self._count_worker.finished.connect(self._on_candidates_loaded)
+        self._count_worker.start()
+
+    def _on_candidates_loaded(self, candidates, nsfw_set):
+        self._all_candidates = candidates
+        self._nsfw_set = nsfw_set
+        self._candidates_loaded = True
+        self._apply_filter_from_cache()
+
+    def _apply_filter_from_cache(self):
+        if self.chk_sfw_only.isChecked() and self._nsfw_set:
+            nsfw = self._nsfw_set
+            self._resolved_paths = [p for p in self._all_candidates if p not in nsfw]
+        else:
+            self._resolved_paths = list(self._all_candidates)
+        self.lbl_count.setText(f"📊 จำนวนไฟล์ที่จะส่งออก: {len(self._resolved_paths):,} ไฟล์")
 
     def _update_target_count(self):
-        sfw_only = self.chk_sfw_only.isChecked()
-        try:
-            conn = sqlite3.connect(self.db_file, timeout=10.0)
-            cursor = conn.cursor()
-            if self.initial_file_paths:
-                candidates = [p for p in self.initial_file_paths if os.path.exists(p)]
-            else:
-                cursor.execute("SELECT DISTINCT path FROM file_tags WHERE tag_name != '__none__' AND category != 99")
-                candidates = [r[0] for r in cursor.fetchall() if os.path.exists(r[0])]
+        if self._candidates_loaded:
+            self._apply_filter_from_cache()
+        elif self._count_worker is None or not self._count_worker.isRunning():
+            self._start_async_count()
 
-            if sfw_only and candidates:
-                from query_parser import resolve_matching_paths, parse_search_query
-                sfw_set = resolve_matching_paths(conn, parse_search_query("rating:sfw"))
-                if sfw_set is not None:
-                    candidates = [p for p in candidates if p in sfw_set]
-            conn.close()
-            self._resolved_paths = candidates
-        except Exception:
-            self._resolved_paths = list(self.initial_file_paths)
+    def _stop_count_worker(self):
+        w = self._count_worker
+        if w is not None:
+            if w.isRunning():
+                w.stop()
+                w.wait(300)
+            self._count_worker = None
 
-        self.lbl_count.setText(f"📊 จำนวนไฟล์ที่จะส่งออก: {len(self._resolved_paths):,} ไฟล์")
+    def closeEvent(self, event):
+        self._stop_count_worker()
+        super().closeEvent(event)
+
+    def reject(self):
+        self._stop_count_worker()
+        super().reject()
 
     def browse_dir(self):
         d = QFileDialog.getExistingDirectory(self, "เลือกโฟลเดอร์สำหรับบันทึก Dataset", self.input_dir.text())
@@ -540,6 +654,8 @@ class DatasetExporterDialog(MinimizableDialog):
         if not out_dir:
             QMessageBox.warning(self, "แจ้งเตือน", "กรุณาเลือกโฟลเดอร์ปลายทางสำหรับส่งออก Dataset")
             return
+        if not self._candidates_loaded and self._count_worker is not None and self._count_worker.isRunning():
+            self._count_worker.wait(3000)
         if not self._resolved_paths:
             QMessageBox.warning(self, "แจ้งเตือน", "ไม่พบไฟล์ที่ตรงตามเงื่อนไขสำหรับส่งออก")
             return
