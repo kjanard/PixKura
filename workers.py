@@ -476,7 +476,8 @@ class FolderCacheScanner(QRunnable):
             _safe_emit(self.signals.api_log, log_msg)
 
         except Exception as e:
-            logging.error(f"Error in FolderCacheScanner: {e}")
+            if not _shutting_down and self.running and "closed database" not in str(e).lower() and "interrupted" not in str(e).lower():
+                logging.error(f"Error in FolderCacheScanner: {e}")
         finally:
             pass
         
@@ -592,7 +593,9 @@ class ThumbnailGeneratorWorker(QRunnable):
                 pass
             # Emit blob (ไม่ใช่ QImage) — UI จะ decode เฉพาะตอนแสดงผลจริง
             _safe_emit(self.signals.folder_updated, self.gen_id, self.artist_id, name, blob, file_count, current_mtime, current_ctime)
-        except Exception as e: logging.error(f"Error: {e}")
+        except Exception as e:
+            if not _shutting_down and "closed database" not in str(e).lower() and "interrupted" not in str(e).lower():
+                logging.error(f"Error: {e}")
 
     def composite(self, path, files):
         if not files: return None
