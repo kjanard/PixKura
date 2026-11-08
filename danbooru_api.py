@@ -155,6 +155,7 @@ class DanbooruClient:
                 "only": "id,name,other_names,urls",
                 "limit": 5
             }
+            res = None
             try:
                 res = self._request_with_retry("GET", url, params=params)
                 if res and res.status_code == 200:
@@ -180,6 +181,10 @@ class DanbooruClient:
                                     return raw_name.replace("_", " ").title()
             except Exception as e:
                 logger.debug(f"Error querying Danbooru for ID {aid}: {e}")
+            finally:
+                if res is not None:
+                    try: res.close()
+                    except Exception: pass
 
         return None
 
@@ -200,9 +205,10 @@ class DanbooruClient:
         }
         for pattern in patterns:
             url = f"{self.SAFEBOORU_URL}/artists.json?search[url_matches]={pattern}"
+            res = None
             try:
                 self._wait_rate_limit()
-                res = requests.get(url, headers=headers, timeout=8)
+                res = self.session.get(url, headers=headers, timeout=8)
                 if res.status_code == 200:
                     data = res.json()
                     if isinstance(data, list) and len(data) > 0:
@@ -211,4 +217,16 @@ class DanbooruClient:
                             return raw_name.replace("_", " ").title()
             except Exception as e:
                 logger.debug(f"Error querying Safebooru for ID {aid}: {e}")
+            finally:
+                if res is not None:
+                    try: res.close()
+                    except Exception: pass
         return None
+
+    def close(self):
+        """Closes the underlying requests.Session connection pool."""
+        if hasattr(self, 'session') and self.session is not None:
+            try:
+                self.session.close()
+            except Exception:
+                pass

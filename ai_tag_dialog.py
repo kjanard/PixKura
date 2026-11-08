@@ -347,6 +347,7 @@ class AiTagDialog(MinimizableDialog):
         # Log Window
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
+        self.log_text.document().setMaximumBlockCount(2000)
         self.log_text.setStyleSheet("""
             QTextEdit {
                 background-color: #0f172a;
@@ -759,9 +760,21 @@ class AiTagDialog(MinimizableDialog):
 
         self.lbl_eta.setText("⏳ เหลือ: สำเร็จ ✨")
         self.refresh_stats(force_refresh=True)
+        if self.worker:
+            try: self.worker.signals.progress.disconnect(self.on_scan_progress)
+            except Exception: pass
+            try: self.worker.signals.item_tagged.disconnect(self.on_item_tagged)
+            except Exception: pass
+            try: self.worker.signals.log.disconnect(self.on_scan_log)
+            except Exception: pass
+            try: self.worker.signals.finished.disconnect(self.on_scan_finished)
+            except Exception: pass
+            try: self.worker.signals.paused.disconnect(self.on_scan_paused)
+            except Exception: pass
         self.worker = None
 
     def closeEvent(self, event):
+        self.timer_stopwatch.stop()
         if self.worker and self.worker.running:
             reply = QMessageBox.question(
                 self, "ยืนยันการปิดหน้าต่าง",
@@ -770,6 +783,17 @@ class AiTagDialog(MinimizableDialog):
             )
             if reply == QMessageBox.StandardButton.Yes:
                 self.worker.stop()
+                try: self.worker.signals.progress.disconnect(self.on_scan_progress)
+                except Exception: pass
+                try: self.worker.signals.item_tagged.disconnect(self.on_item_tagged)
+                except Exception: pass
+                try: self.worker.signals.log.disconnect(self.on_scan_log)
+                except Exception: pass
+                try: self.worker.signals.finished.disconnect(self.on_scan_finished)
+                except Exception: pass
+                try: self.worker.signals.paused.disconnect(self.on_scan_paused)
+                except Exception: pass
+                self.worker = None
                 event.accept()
             else:
                 event.ignore()

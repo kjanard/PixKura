@@ -2038,6 +2038,15 @@ class AiTaggingWorker(QRunnable):
         self.running = True
         self.is_paused = False
         self._pause_cond = threading.Condition()
+        self.tagger = None
+
+    def _cleanup_tagger(self):
+        if getattr(self, 'tagger', None) is not None:
+            try:
+                self.tagger.unload()
+            except Exception:
+                pass
+            self.tagger = None
 
     def pause(self):
         with self._pause_cond:
@@ -2070,6 +2079,7 @@ class AiTaggingWorker(QRunnable):
         try:
             tagger = WD14Tagger(model_key=self.model_key, use_gpu=self.use_gpu, use_fp16=self.use_fp16 if self.use_gpu else False)
             tagger.load_model()
+            self.tagger = tagger
             _safe_emit(self.signals.log, f"✅ โหลดโมเดล {model_meta['short_name']} สำเร็จ (ทำงานบน: {tagger.active_provider} | {precision_label})")
         except Exception as e:
             _safe_emit(self.signals.log, f"❌ โหลดโมเดลไม่สำเร็จ: {e}")
@@ -2165,12 +2175,14 @@ class AiTaggingWorker(QRunnable):
         except Exception as e:
             _safe_emit(self.signals.log, f"❌ เกิดข้อผิดพลาดในการค้นหาไฟล์: {e}")
             _safe_emit(self.signals.finished, 0, 1, 0.0)
+            self._cleanup_tagger()
             return
 
         total_files = len(target_files)
         if total_files == 0:
             _safe_emit(self.signals.log, "✨ ไม่มีไฟล์ใหม่ที่ต้องสแกนแท็ก (ไฟล์ทั้งหมดมีแท็กครบแล้ว)")
             _safe_emit(self.signals.finished, 0, 0, 0.0)
+            self._cleanup_tagger()
             return
 
         # Storage profile determination & Auto-detect
@@ -2396,6 +2408,7 @@ class AiTaggingWorker(QRunnable):
         total_elapsed = time.time() - start_time
         _safe_emit(self.signals.log, f"🎉 สแกนเสร็จสิ้น: สำเร็จ {processed_count:,} ไฟล์, ข้อผิดพลาด {error_count} (เวลา {total_elapsed:.1f} วินาที)")
         _safe_emit(self.signals.finished, processed_count, error_count, total_elapsed)
+        self._cleanup_tagger()
 
 
 class DuplicateScannerSignals(QObject):
@@ -2465,9 +2478,15 @@ class DuplicateScannerWorker(QRunnable):
             if not dhash:
                 pil_img, _ = load_media_thumbnail(path)
                 if pil_img:
-                    dhash = compute_dhash(pil_img)
-                    if dhash:
-                        db_updates.append((dhash, path))
+                    try:
+                        dhash = compute_dhash(pil_img)
+                        if dhash:
+                            db_updates.append((dhash, path))
+                    finally:
+                        try:
+                            pil_img.close()
+                        except Exception:
+                            pass
             if dhash:
                 hashed_items.append((path, size or 0, mtime or 0.0, dhash))
 

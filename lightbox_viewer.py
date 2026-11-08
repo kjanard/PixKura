@@ -1743,14 +1743,21 @@ class LightboxViewerDialog(MinimizableDialog):
                     self.btn_explorer.setText("📂 Opening...")
                     safe_single_shot(1200, self.btn_explorer, lambda: self.btn_explorer.setText("📂 Open in Explorer"))
 
-    def closeEvent(self, event):
+    def _cleanup_resources(self):
         self.stop_all_playback()
+        if hasattr(self, 'img_view') and self.img_view:
+            self.img_view.orig_pixmap = None
+            self.img_view.placeholder_text = ""
+        self.file_paths = []
+
+    def closeEvent(self, event):
+        self._cleanup_resources()
         super().closeEvent(event)
 
     def accept(self):
-        self.stop_all_playback()
+        self._cleanup_resources()
         super().accept()
 
     def reject(self):
-        self.stop_all_playback()
+        self._cleanup_resources()
         super().reject()

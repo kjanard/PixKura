@@ -479,6 +479,44 @@ class TestUIDialogs(unittest.TestCase):
         self.assertEqual(len(session_inside), 1)
         self.assertIsNone(worker2.session)
 
+    def test_comprehensive_dialog_and_worker_leak_hardening(self):
+        from components import MinimizableDialog
+        from ai_tag_dialog import AiTagDialog
+        from lightbox_viewer import LightboxViewerDialog
+        from danbooru_api import DanbooruClient
+        from tagger import WD14Tagger
+        from PyQt6.QtCore import Qt
+
+        # 1. MinimizableDialog WA_DeleteOnClose
+        base_dlg = MinimizableDialog()
+        self.assertTrue(base_dlg.testAttribute(Qt.WidgetAttribute.WA_DeleteOnClose))
+        base_dlg.close()
+
+        # 2. AiTagDialog log buffer capping & cleanup
+        ai_dlg = AiTagDialog()
+        self.assertEqual(ai_dlg.log_text.document().maximumBlockCount(), 2000)
+        ai_dlg.close()
+
+        # 3. LightboxViewerDialog resource cleanup
+        icon_path = os.path.join(WORKSPACE_DIR, "icon.ico")
+        paths = [icon_path, icon_path] if os.path.exists(icon_path) else []
+        lb_dlg = LightboxViewerDialog(paths, current_index=0)
+        self.assertEqual(len(lb_dlg.file_paths), len(paths))
+        lb_dlg.close()
+        self.assertEqual(len(lb_dlg.file_paths), 0)
+        self.assertIsNone(lb_dlg.img_view.orig_pixmap)
+
+        # 4. DanbooruClient close session
+        dan_client = DanbooruClient(username="test_user", api_key="test_key")
+        self.assertIsNotNone(dan_client.session)
+        dan_client.close()
+
+        # 5. WD14Tagger unload
+        tagger = WD14Tagger()
+        tagger.session = "mock_session"
+        tagger.unload()
+        self.assertIsNone(tagger.session)
+
 if __name__ == "__main__":
     unittest.main()
 

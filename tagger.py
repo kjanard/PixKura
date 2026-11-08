@@ -394,6 +394,15 @@ class WD14Tagger:
         self.output_name = self.session.get_outputs()[0].name
         logging.info(f"Initialized WD14Tagger on {self.active_provider} (FP32). Input: {self.input_name} {self.input_shape} ({self.input_dtype})")
 
+    def unload(self):
+        """Releases ONNX Runtime InferenceSession and GPU / NPU device memory buffers."""
+        if self.is_ensemble:
+            for sub in self.sub_taggers:
+                try: sub.unload()
+                except Exception: pass
+            self.sub_taggers = []
+        self.session = None
+
     def preprocess_image(self, pil_image, target_size=448):
         """
         Preprocesses PIL Image for WD14 Tagger:

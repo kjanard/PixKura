@@ -134,6 +134,7 @@ class MinimizableDialog(QDialog):
             | Qt.WindowType.WindowMinimizeButtonHint 
             | Qt.WindowType.WindowMaximizeButtonHint
         )
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
 
     def changeEvent(self, event):
         if event.type() == QEvent.Type.WindowStateChange:
