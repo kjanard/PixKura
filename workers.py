@@ -40,6 +40,8 @@ import threading
 _thread_local = threading.local()
 _conn_lock = threading.Lock()
 _all_thread_conns = set()
+_conns_by_thread = {}   # (os thread ident, db_file) -> sqlite3.Connection
+_CONN_WARN_THRESHOLD = 64
 _shutting_down = False
 
 
@@ -52,43 +54,55 @@ def _safe_emit(signal, *args):
 
 
 def get_thread_local_conn(db_file, timeout=30.0):
+    """
+    Returns one reusable SQLite connection per (OS thread, db_file).
+
+    NOTE: connections are keyed by `threading.get_ident()` instead of `threading.local()`.
+    On Qt QThreadPool threads PyQt creates and destroys the Python thread state on every
+    QRunnable.run() call, which wipes every `threading.local` value. A thread-local cache
+    therefore never hits there, and each task opened a brand new connection that
+    `_all_thread_conns` kept alive forever (3 handles + ~0.4 MB commit per connection,
+    ~16 connections/s -> tens of GB of commit charge and 300k+ handles after a few hours).
+    The OS thread id is stable across those calls, so pool threads now reuse one connection.
+    """
     if _shutting_down:
         raise sqlite3.OperationalError("Application is shutting down")
-    need_new = (
-        not hasattr(_thread_local, "conn")
-        or _thread_local.conn is None
-        or getattr(_thread_local, "db_file", None) != db_file
-    )
-    if not need_new:
-        try:
-            _thread_local.conn.rollback()
-        except sqlite3.ProgrammingError:
-            need_new = True
-        except Exception:
-            pass
+    key = (threading.get_ident(), db_file)
 
-    if need_new:
-        if hasattr(_thread_local, "conn") and _thread_local.conn is not None:
-            try:
-                with _conn_lock:
-                    _all_thread_conns.discard(_thread_local.conn)
-                _thread_local.conn.close()
-            except Exception:
-                pass
-        conn = sqlite3.connect(db_file, timeout=timeout, check_same_thread=False)
+    with _conn_lock:
+        conn = _conns_by_thread.get(key)
+
+    if conn is not None:
         try:
-            conn.execute('PRAGMA journal_mode = WAL;')
-            conn.execute('PRAGMA synchronous = NORMAL;')
-            conn.execute('PRAGMA cache_size = -4000;')
-            conn.execute('PRAGMA temp_store = MEMORY;')
-            conn.execute('PRAGMA mmap_size = 134217728;')
+            conn.rollback()
+            return conn
+        except sqlite3.ProgrammingError:
+            # Connection was closed underneath us (e.g. close_all_thread_local_conns)
+            with _conn_lock:
+                if _conns_by_thread.get(key) is conn:
+                    del _conns_by_thread[key]
+                _all_thread_conns.discard(conn)
+            conn = None
         except Exception:
-            pass
-        _thread_local.conn = conn
-        _thread_local.db_file = db_file
-        with _conn_lock:
-            _all_thread_conns.add(conn)
-    return _thread_local.conn
+            return conn
+
+    conn = sqlite3.connect(db_file, timeout=timeout, check_same_thread=False)
+    try:
+        conn.execute('PRAGMA journal_mode = WAL;')
+        conn.execute('PRAGMA synchronous = NORMAL;')
+        conn.execute('PRAGMA cache_size = -4000;')
+        conn.execute('PRAGMA temp_store = MEMORY;')
+        conn.execute('PRAGMA mmap_size = 134217728;')
+    except Exception:
+        pass
+    with _conn_lock:
+        _conns_by_thread[key] = conn
+        _all_thread_conns.add(conn)
+        if len(_conns_by_thread) == _CONN_WARN_THRESHOLD:
+            logging.warning(
+                f"[get_thread_local_conn] {_CONN_WARN_THRESHOLD} cached SQLite connections - possible connection leak"
+            )
+    return conn
 
 
 def close_all_thread_local_conns(shutting_down=False):
@@ -102,6 +116,7 @@ def close_all_thread_local_conns(shutting_down=False):
     with _conn_lock:
         conns = list(_all_thread_conns)
         _all_thread_conns.clear()
+        _conns_by_thread.clear()
     for c in conns:
         try:
             c.interrupt()

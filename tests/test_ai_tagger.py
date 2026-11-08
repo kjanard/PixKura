@@ -308,6 +308,62 @@ class TestAiTaggingWorker(unittest.TestCase):
         )
         self.assertTrue(worker2.rescan_unknown_chars)
 
+
+class TestThreadLocalConnLeak(unittest.TestCase):
+    """Regression: QThreadPool runnables used to open a brand-new SQLite connection on every run
+    (threading.local is wiped on Qt pool threads), leaking handles and commit memory without bound."""
+
+    def setUp(self):
+        import workers
+        workers.close_all_thread_local_conns()
+        self.temp_db_fd, self.temp_db_path = tempfile.mkstemp(suffix=".db")
+        DatabaseSetup(self.temp_db_path)
+
+    def tearDown(self):
+        import workers
+        workers.close_all_thread_local_conns()
+        os.close(self.temp_db_fd)
+        for suffix in ("", "-wal", "-shm"):
+            try: os.remove(self.temp_db_path + suffix)
+            except Exception: pass
+
+    def test_qthreadpool_reuses_connections(self):
+        import threading
+        import workers
+        from PyQt6.QtCore import QRunnable, QThreadPool
+
+        db_path = self.temp_db_path
+        seen = []
+        lock = threading.Lock()
+
+        class Task(QRunnable):
+            def run(self):
+                conn = workers.get_thread_local_conn(db_path)
+                conn.execute("SELECT 1").fetchone()
+                with lock:
+                    seen.append(id(conn))
+
+        pool = QThreadPool()
+        pool.setMaxThreadCount(3)
+        for _ in range(300):
+            pool.start(Task())
+        pool.waitForDone()
+
+        self.assertEqual(len(seen), 300)
+        self.assertLessEqual(len(set(seen)), 3, "Pool threads must reuse one connection each")
+        conns_for_db = [c for (t_ident, db), c in workers._conns_by_thread.items() if db == db_path]
+        self.assertLessEqual(len(conns_for_db), 3)
+
+    def test_same_thread_gets_same_connection_and_close_all_resets(self):
+        import workers
+        c1 = workers.get_thread_local_conn(self.temp_db_path)
+        c2 = workers.get_thread_local_conn(self.temp_db_path)
+        self.assertIs(c1, c2)
+        workers.close_all_thread_local_conns()
+        c3 = workers.get_thread_local_conn(self.temp_db_path)
+        self.assertIsNot(c1, c3)
+        c3.execute("SELECT 1").fetchone()
+
 class TestStreamScannerFiltering(unittest.TestCase):
     def setUp(self):
         self.temp_db_fd, self.temp_db_path = tempfile.mkstemp(suffix=".db")

@@ -35,6 +35,9 @@ All notable changes to the PixKura project will be documented in this file.
   * Added configurable Batch Size selector (`Batch = 4 / 8 / 16 / 32`) in `AiTagDialog` to scale from 2 GB integrated GPUs to 24 GB flagship GPUs.
 
 ### Fixed & Optimized
+* **Critical SQLite Connection & Handle Leak on QThreadPool (`workers.py`, `tests/test_ai_tagger.py`)**:
+  * Fixed massive handle (343,000+ handles) and commit charge (49.5 GB virtual memory exhaustion) leak caused by `get_thread_local_conn()`. On PyQt6 `QThreadPool` worker threads, Python's thread state (`PyThreadState`) is wiped on every `QRunnable.run()` invocation, causing `threading.local()` attributes to reset every time. As a result, background prefetchers and thumbnail workers opened a brand-new `sqlite3.connect()` on every iteration (~16 new connections/sec) which were held alive indefinitely in `_all_thread_conns`.
+  * Replaced `threading.local()` with `(threading.get_ident(), db_file)` dictionary keying (`_conns_by_thread`), allowing persistent OS threads in `QThreadPool` to properly reuse their cached connections. Connections and file handles now remain strictly bounded across long-running scans. Added automated regression test `TestThreadLocalConnLeak`.
 * **OpenCV Alpha Channel Black-Background Bug in AI Tagger (`workers.py`)**:
   * Fixed critical accuracy bug in `AiTaggingWorker` where `cv2.imdecode(..., cv2.IMREAD_COLOR)` stripped the alpha channel of transparent PNGs and turned transparent regions pitch black `(0, 0, 0)` instead of white `(255, 255, 255)`, causing WD14/WDv3 models to mispredict `black_background` / `dark` tags and miss character features. Implemented `decode_image_cv2_for_wd14()` using `IMREAD_UNCHANGED` with fast vectorized white-background alpha compositing, 2D grayscale handling, and dynamic `input_dtype`/`input_shape` support.
 * **Qt Deleted C++ Object `RuntimeError` Crash Fix (`utils.py`, `workers.py`, `main.py`, `lightbox_viewer.py`)**:
