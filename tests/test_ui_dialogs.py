@@ -441,6 +441,44 @@ class TestUIDialogs(unittest.TestCase):
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
+    def test_pixiv_download_dialog_and_worker_leak_hardening(self):
+        from download_dialog import PixivDownloadDialog
+        from workers import PixivDownloaderWorker
+        from unittest.mock import patch, MagicMock
+
+        # 1. Dialog buffer hardening test
+        dlg = PixivDownloadDialog(default_dir="")
+        self.assertIsNotNone(dlg)
+        self.assertEqual(dlg.log_area.document().maximumBlockCount(), 2000)
+
+        # Simulate attaching worker and finishing
+        worker = PixivDownloaderWorker(mode="ILLUST", target_id="12345", output_dir="")
+        dlg.worker = worker
+        worker.signals.log.connect(dlg.add_log)
+        worker.signals.progress.connect(dlg.update_progress)
+        worker.signals.finished.connect(dlg.download_finished)
+
+        with patch("PyQt6.QtWidgets.QMessageBox.information") as mock_info:
+            dlg.download_finished(True, "Finished successfully")
+        
+        # Ensure worker reference is cleared
+        self.assertIsNone(dlg.worker)
+        dlg.close()
+
+        # 2. Worker session lifecycle test
+        worker2 = PixivDownloaderWorker(mode="ILLUST", target_id="999999", output_dir="")
+        self.assertIsNone(worker2.session)
+        session_inside = []
+        def mock_do_download():
+            session_inside.append(worker2.session)
+            self.assertIsNotNone(worker2.session)
+        
+        with patch.object(worker2, "_do_download", side_effect=mock_do_download):
+            worker2.run()
+
+        self.assertEqual(len(session_inside), 1)
+        self.assertIsNone(worker2.session)
+
 if __name__ == "__main__":
     unittest.main()
 

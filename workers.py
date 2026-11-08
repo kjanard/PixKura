@@ -358,7 +358,8 @@ class FolderCacheScanner(QRunnable):
             _safe_emit(self.signals.api_log, "📂 กำลังตรวจสอบการเปลี่ยนแปลงและนับไฟล์ในทุกโฟลเดอร์...")
 
             try:
-                real_folders = [f.name for f in os.scandir(self.root) if f.is_dir() and not f.name.startswith('.')]
+                with os.scandir(self.root) as it:
+                    real_folders = [f.name for f in it if f.is_dir() and not f.name.startswith('.')]
             except Exception as e:
                 logging.error(f"Error scanning root dir: {e}")
                 real_folders = []
@@ -970,11 +971,16 @@ class ApiFetcherWorker(QRunnable):
     def download_image(self, url):
         # Pixiv ต้องการ Referer ไม่งั้น 403
         headers = {'Referer': 'https://app-api.pixiv.net/'}
+        r = None
         try:
             r = requests.get(url, headers=headers, stream=True, timeout=5)
             if r.status_code == 200:
                 return r.content
         except Exception as e: logging.error(f"Error: {e}")
+        finally:
+            if r is not None:
+                try: r.close()
+                except Exception: pass
         return None
 
     @pyqtSlot()
@@ -1041,6 +1047,8 @@ class BooruNameUpdateWorker(QRunnable):
         is_pixiv_deleted = False
 
         # --- Source 1: Official Pixiv AJAX API (No login/cookie needed for public profile details) ---
+        res = None
+        r_img = None
         try:
             pixiv_url = f"https://www.pixiv.net/ajax/user/{aid}?lang=en"
             headers = {
@@ -1063,6 +1071,10 @@ class BooruNameUpdateWorker(QRunnable):
                                     avatar_blob = r_img.content
                             except Exception:
                                 pass
+                            finally:
+                                if r_img is not None:
+                                    try: r_img.close()
+                                    except Exception: pass
                 else:
                     msg = str(data.get('message', '')).lower()
                     if 'left pixiv' in msg or 'not exist' in msg:
@@ -1071,6 +1083,10 @@ class BooruNameUpdateWorker(QRunnable):
                 is_pixiv_deleted = True
         except Exception as e:
             logging.debug(f"Pixiv fetch error for ID {aid}: {e}")
+        finally:
+            if res is not None:
+                try: res.close()
+                except Exception: pass
 
         # --- Source 2: Danbooru (DanbuDL Engine with Exact URL Verification) ---
         if not found_name and self.running:
@@ -1090,40 +1106,45 @@ class BooruNameUpdateWorker(QRunnable):
 
     @pyqtSlot()
     def run(self):
-        # ใช้ ThreadPool แยกร่างทำงานพร้อมกันทีละ 3 คน
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            futures = {executor.submit(self.fetch_artist, aid): aid for aid in self.ids}
+        # ใช้ ThreadPool แยกร่างทำงานพร้อมกันทีละ 3 คน ในชุดละ 100 รายการเพื่อไม่สร้างคิวล้น RAM
+        BATCH_SIZE = 100
+        for i in range(0, len(self.ids), BATCH_SIZE):
+            if not self.running:
+                break
+            batch = self.ids[i:i + BATCH_SIZE]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                futures = {executor.submit(self.fetch_artist, aid): aid for aid in batch}
 
-            for future in concurrent.futures.as_completed(futures):
-                if not self.running: 
-                    executor.shutdown(wait=False, cancel_futures=True)
-                    break
+                for future in concurrent.futures.as_completed(futures):
+                    if not self.running: 
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        break
 
-                aid, found_name, avatar_blob, status = future.result()
+                    aid, found_name, avatar_blob, status = future.result()
 
-                if found_name:
-                    try:
-                        conn_write = get_thread_local_conn(DB_FILE, timeout=5.0)
-                        cursor_write = conn_write.cursor()
-                        if avatar_blob:
-                            cursor_write.execute('UPDATE artists SET name=?, profile_blob=? WHERE artist_id=?', (found_name, avatar_blob, aid))
-                            if cursor_write.rowcount == 0:
-                                cursor_write.execute('INSERT INTO artists (artist_id, name, profile_blob) VALUES (?, ?, ?)', (aid, found_name, avatar_blob))
+                    if found_name:
+                        try:
+                            conn_write = get_thread_local_conn(DB_FILE, timeout=5.0)
+                            cursor_write = conn_write.cursor()
+                            if avatar_blob:
+                                cursor_write.execute('UPDATE artists SET name=?, profile_blob=? WHERE artist_id=?', (found_name, avatar_blob, aid))
+                                if cursor_write.rowcount == 0:
+                                    cursor_write.execute('INSERT INTO artists (artist_id, name, profile_blob) VALUES (?, ?, ?)', (aid, found_name, avatar_blob))
+                            else:
+                                cursor_write.execute('UPDATE artists SET name=?, profile_blob=COALESCE(?, profile_blob) WHERE artist_id=?', (found_name, None, aid))
+                                if cursor_write.rowcount == 0:
+                                    cursor_write.execute('INSERT INTO artists (artist_id, name) VALUES (?, ?)', (aid, found_name))
+                            conn_write.commit()
+                        except Exception as e:
+                            logging.error(f"Error saving artist {aid}: {e}")
+
+                        _safe_emit(self.signals.api_updated, aid, found_name, avatar_blob)
+                        if status == "deleted":
+                            _safe_emit(self.signals.api_log, f"ID {aid}: บัญชีถูกลบ/ปิดไปแล้วจาก Pixiv -> บันทึกเป็น [Deleted User]")
                         else:
-                            cursor_write.execute('UPDATE artists SET name=?, profile_blob=COALESCE(?, profile_blob) WHERE artist_id=?', (found_name, None, aid))
-                            if cursor_write.rowcount == 0:
-                                cursor_write.execute('INSERT INTO artists (artist_id, name) VALUES (?, ?)', (aid, found_name))
-                        conn_write.commit()
-                    except Exception as e:
-                        logging.error(f"Error saving artist {aid}: {e}")
-
-                    _safe_emit(self.signals.api_updated, aid, found_name, avatar_blob)
-                    if status == "deleted":
-                        _safe_emit(self.signals.api_log, f"ID {aid}: บัญชีถูกลบ/ปิดไปแล้วจาก Pixiv -> บันทึกเป็น [Deleted User]")
+                            _safe_emit(self.signals.api_log, f"Found: {found_name}")
                     else:
-                        _safe_emit(self.signals.api_log, f"Found: {found_name}")
-                else:
-                    _safe_emit(self.signals.api_log, f"ID {aid} not found in Pixiv/Danbooru/Safebooru")
+                        _safe_emit(self.signals.api_log, f"ID {aid} not found in Pixiv/Danbooru/Safebooru")
 
         _safe_emit(self.signals.api_log, "Name Update Finished")
 
@@ -1185,27 +1206,30 @@ class BackgroundThumbnailPreloader(QRunnable):
             cursor = conn.cursor()
 
             executor = concurrent.futures.ThreadPoolExecutor(max_workers=num_workers)
+            BATCH_CHUNK = 200
             try:
-                # ส่งงานย่อยทั้งหมดเข้าคิวขนาน
-                future_to_path = {executor.submit(generate_thumbnail, p): p for p in pending_files}
-
-                for future in concurrent.futures.as_completed(future_to_path):
+                for b_idx in range(0, len(pending_files), BATCH_CHUNK):
                     if not self.running:
-                        # หากโปรแกรมถูกสั่งหยุด ให้ยกเลิกงานที่เหลือในคิวขนานทันที
-                        executor.shutdown(wait=False, cancel_futures=True)
                         break
+                    chunk = pending_files[b_idx:b_idx + BATCH_CHUNK]
+                    future_to_path = {executor.submit(generate_thumbnail, p): p for p in chunk}
 
-                    try:
-                        path, blob = future.result()
-                        if blob:
-                            cursor.execute("INSERT OR REPLACE INTO file_thumbnails (path, image_data) VALUES (?, ?)", (path, blob))
-                            uncommitted.append(path)
+                    for future in concurrent.futures.as_completed(future_to_path):
+                        if not self.running:
+                            executor.shutdown(wait=False, cancel_futures=True)
+                            break
 
-                            if len(uncommitted) >= 50:
-                                conn.commit()
-                                uncommitted = []
-                    except Exception:
-                        pass
+                        try:
+                            path, blob = future.result()
+                            if blob:
+                                cursor.execute("INSERT OR REPLACE INTO file_thumbnails (path, image_data) VALUES (?, ?)", (path, blob))
+                                uncommitted.append(path)
+
+                                if len(uncommitted) >= 50:
+                                    conn.commit()
+                                    uncommitted = []
+                        except Exception:
+                            pass
             finally:
                 executor.shutdown(wait=False, cancel_futures=True)
 
@@ -1239,6 +1263,7 @@ class PixivDownloaderWorker(QRunnable):
         self.end_page = end_page
         self.signals = DownloadSignals()
         self.running = True
+        self.session = None
 
     def stop(self):
         self.running = False
@@ -1249,29 +1274,41 @@ class PixivDownloaderWorker(QRunnable):
             time.sleep(min(step, seconds - elapsed))
             elapsed += step
 
+    def _get_requester(self):
+        if self.session is not None:
+            return self.session
+        return requests
+
     def download_image(self, url, filepath):
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Referer': 'https://www.pixiv.net/'
         }
+        r = None
         try:
-            r = requests.get(url, headers=headers, stream=True, timeout=15)
+            req = self._get_requester()
+            r = req.get(url, headers=headers, stream=True, timeout=15)
             if r.status_code == 200:
                 os.makedirs(os.path.dirname(filepath), exist_ok=True)
                 with open(filepath, 'wb') as f:
                     for chunk in r.iter_content(chunk_size=8192):
                         if not self.running:
-                            f.close()
-                            if os.path.exists(filepath):
-                                try: os.remove(filepath)
-                                except Exception: pass
-                            return False
+                            break
                         f.write(chunk)
+                if not self.running:
+                    if os.path.exists(filepath):
+                        try: os.remove(filepath)
+                        except Exception: pass
+                    return False
                 return True
         except Exception as e:
             _safe_emit(self.signals.log, f"❌ Error downloading {os.path.basename(filepath)}: {e}")
             if os.path.exists(filepath):
                 try: os.remove(filepath)
+                except Exception: pass
+        finally:
+            if r is not None:
+                try: r.close()
                 except Exception: pass
         return False
 
@@ -1308,10 +1345,14 @@ class PixivDownloaderWorker(QRunnable):
     def process_ugoira(self, ill_id, headers, dest_dir, filename_prefix, artist_id=None, artist_name=None):
         meta_url = f"https://www.pixiv.net/ajax/illust/{ill_id}/ugoira_meta"
         temp_zip = None
+        pil_frames = []
+        durations = []
+        r = None
         try:
             req_headers = headers.copy()
             req_headers['Referer'] = f"https://www.pixiv.net/artworks/{ill_id}"
-            r = requests.get(meta_url, headers=req_headers, timeout=15)
+            req = self._get_requester()
+            r = req.get(meta_url, headers=req_headers, timeout=15)
             if r.status_code != 200:
                 if r.status_code == 404:
                     if not self.cookie:
@@ -1349,8 +1390,6 @@ class PixivDownloaderWorker(QRunnable):
                 return False
         
             _safe_emit(self.signals.log, "   🔄 Converting Ugoira ZIP to MP4 video...")
-            pil_frames = []
-            durations = []
             total_uncompressed = 0
             with zipfile.ZipFile(temp_zip, 'r') as z:
                 for frame_info in frames:
@@ -1406,13 +1445,30 @@ class PixivDownloaderWorker(QRunnable):
                 try: os.remove(temp_zip)
                 except Exception: pass
             return False
+        finally:
+            if r is not None:
+                try: r.close()
+                except Exception: pass
+            if temp_zip and os.path.exists(temp_zip):
+                try: os.remove(temp_zip)
+                except Exception: pass
+            if pil_frames:
+                for f_img in pil_frames:
+                    try: f_img.close()
+                    except Exception: pass
+                pil_frames.clear()
+            durations.clear()
+            import gc
+            gc.collect()
 
     def get_illust_pages(self, ill_id, headers, ill_body):
         page_count = ill_body.get('pageCount', 1)
         if page_count > 1:
             pages_url = f"https://www.pixiv.net/ajax/illust/{ill_id}/pages"
+            r = None
             try:
-                r = requests.get(pages_url, headers=headers, timeout=15)
+                req = self._get_requester()
+                r = req.get(pages_url, headers=headers, timeout=15)
                 if r.status_code == 200:
                     data = r.json()
                     if not data.get('error'):
@@ -1421,6 +1477,10 @@ class PixivDownloaderWorker(QRunnable):
                             return pages
             except Exception as e:
                 _safe_emit(self.signals.log, f"   ⚠️ Failed to fetch pages details for Illust {ill_id}: {e}")
+            finally:
+                if r is not None:
+                    try: r.close()
+                    except Exception: pass
     
         # Fallback to single page urls.original
         orig_url = ill_body.get('urls', {}).get('original')
@@ -1430,6 +1490,23 @@ class PixivDownloaderWorker(QRunnable):
 
     @pyqtSlot()
     def run(self):
+        import requests.adapters
+        self.session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=3)
+        self.session.mount('https://', adapter)
+        self.session.mount('http://', adapter)
+        try:
+            self._do_download()
+        finally:
+            if self.session is not None:
+                try:
+                    self.session.close()
+                except Exception:
+                    pass
+                self.session = None
+
+    def _do_download(self):
+        req = self._get_requester()
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Referer': 'https://www.pixiv.net/'
@@ -1446,8 +1523,9 @@ class PixivDownloaderWorker(QRunnable):
         if self.mode == 'ILLUST':
             _safe_emit(self.signals.log, f"🔍 Fetching illust metadata for ID: {self.target_id}...")
             url = f"https://www.pixiv.net/ajax/illust/{self.target_id}"
+            r = None
             try:
-                r = requests.get(url, headers=headers, timeout=10)
+                r = req.get(url, headers=headers, timeout=10)
                 if r.status_code != 200:
                     _safe_emit(self.signals.finished, False, f"HTTP Error {r.status_code} when fetching illust data.")
                     return
@@ -1455,6 +1533,15 @@ class PixivDownloaderWorker(QRunnable):
                 if data.get('error'):
                     _safe_emit(self.signals.finished, False, f"Pixiv API Error: {data.get('message', 'Unknown error')}")
                     return
+            except Exception as e:
+                _safe_emit(self.signals.finished, False, str(e))
+                return
+            finally:
+                if r is not None:
+                    try: r.close()
+                    except Exception: pass
+
+            try:
             
                 body = data.get('body', {})
                 artist_id = str(body.get('userId'))
@@ -1528,8 +1615,9 @@ class PixivDownloaderWorker(QRunnable):
         elif self.mode == 'ARTIST':
             _safe_emit(self.signals.log, f"🔍 Fetching artist profile for ID: {self.target_id}...")
             url = f"https://www.pixiv.net/ajax/user/{self.target_id}/profile/all"
+            r = None
             try:
-                r = requests.get(url, headers=headers, timeout=15)
+                r = req.get(url, headers=headers, timeout=15)
                 if r.status_code != 200:
                     _safe_emit(self.signals.finished, False, f"HTTP Error {r.status_code} when fetching artist profile.")
                     return
@@ -1537,7 +1625,15 @@ class PixivDownloaderWorker(QRunnable):
                 if data.get('error'):
                     _safe_emit(self.signals.finished, False, f"Pixiv API Error: {data.get('message', 'Unknown error')}")
                     return
+            except Exception as e:
+                _safe_emit(self.signals.finished, False, str(e))
+                return
+            finally:
+                if r is not None:
+                    try: r.close()
+                    except Exception: pass
             
+            try:
                 body = data.get('body', {})
                 illusts = body.get('illusts', {}) or {}
                 manga = body.get('manga', {}) or {}
@@ -1554,11 +1650,19 @@ class PixivDownloaderWorker(QRunnable):
             
                 artist_name = "Artist " + self.target_id
                 first_url = f"https://www.pixiv.net/ajax/illust/{illust_ids[0]}"
-                r_first = requests.get(first_url, headers=headers, timeout=15)
-                if r_first.status_code == 200:
-                    first_data = r_first.json()
-                    if not first_data.get('error'):
-                        artist_name = first_data.get('body', {}).get('userName', artist_name)
+                r_first = None
+                try:
+                    r_first = req.get(first_url, headers=headers, timeout=15)
+                    if r_first.status_code == 200:
+                        first_data = r_first.json()
+                        if not first_data.get('error'):
+                            artist_name = first_data.get('body', {}).get('userName', artist_name)
+                except Exception:
+                    pass
+                finally:
+                    if r_first is not None:
+                        try: r_first.close()
+                        except Exception: pass
             
                 artist_folder = self.target_id
                 dest_dir = os.path.join(self.output_dir, artist_folder)
@@ -1591,8 +1695,9 @@ class PixivDownloaderWorker(QRunnable):
                     _safe_emit(self.signals.log, f"🖼️ [{idx+1}/{total_new}] Fetching metadata for Illust ID {ill_id}...")
                 
                     illust_url = f"https://www.pixiv.net/ajax/illust/{ill_id}"
+                    r_ill = None
                     try:
-                        r_ill = requests.get(illust_url, headers=headers, timeout=15)
+                        r_ill = req.get(illust_url, headers=headers, timeout=15)
                         if r_ill.status_code == 200:
                             ill_data = r_ill.json()
                             if not ill_data.get('error'):
@@ -1611,7 +1716,7 @@ class PixivDownloaderWorker(QRunnable):
                                     else:
                                         _safe_emit(self.signals.log, f"   🎬 Illust ID {ill_id} is a Ugoira (Animation). Processing...")
                                         if self.process_ugoira(ill_id, headers, dest_dir, filename_prefix, artist_id=self.target_id, artist_name=artist_name):
-                                            downloaded_works += 1
+                                             downloaded_works += 1
                                 
                                     if self.max_limit and downloaded_works >= self.max_limit:
                                         _safe_emit(self.signals.log, f"🛑 Reached download limit of {self.max_limit} works. Stopping.")
@@ -1656,6 +1761,10 @@ class PixivDownloaderWorker(QRunnable):
                                         return
                     except Exception as e:
                         _safe_emit(self.signals.log, f"   ❌ Error fetching details for Illust {ill_id}: {e}")
+                    finally:
+                        if r_ill is not None:
+                            try: r_ill.close()
+                            except Exception: pass
                 
                     _safe_emit(self.signals.progress, idx + 1, total_new)
                 
@@ -1697,25 +1806,31 @@ class PixivDownloaderWorker(QRunnable):
                         break
                     
                     url = f"https://www.pixiv.net/ajax/user/{self.target_id}/illusts/bookmarks?tag=&offset={offset}&limit={limit}&rest={self.bookmark_rest}"
-                    r = requests.get(url, headers=headers, timeout=15)
-                    if r.status_code != 200:
-                        _safe_emit(self.signals.finished, False, f"HTTP Error {r.status_code} while fetching bookmark offset {offset}")
-                        return
+                    r = None
+                    try:
+                        r = req.get(url, headers=headers, timeout=15)
+                        if r.status_code != 200:
+                            _safe_emit(self.signals.finished, False, f"HTTP Error {r.status_code} while fetching bookmark offset {offset}")
+                            return
                 
-                    data = r.json()
-                    if data.get('error'):
-                        _safe_emit(self.signals.finished, False, f"Pixiv API Error: {data.get('message', 'Unknown error')}")
-                        return
+                        data = r.json()
+                        if data.get('error'):
+                            _safe_emit(self.signals.finished, False, f"Pixiv API Error: {data.get('message', 'Unknown error')}")
+                            return
                 
-                    body = data.get('body', {})
-                    works = body.get('works', [])
-                    if not works:
-                        break  # No more bookmarks
+                        body = data.get('body', {})
+                        works = body.get('works', [])
+                        if not works:
+                            break  # No more bookmarks
                 
-                    for work in works:
-                        ill_id = str(work.get('id'))
-                        if ill_id:
-                            illust_ids.append(ill_id)
+                        for work in works:
+                            ill_id = str(work.get('id'))
+                            if ill_id:
+                                illust_ids.append(ill_id)
+                    finally:
+                        if r is not None:
+                            try: r.close()
+                            except Exception: pass
                 
                     offset += limit
                     _safe_emit(self.signals.log, f"📋 Found {len(illust_ids)} bookmarks so far (Current: Page {current_page})...")
@@ -1762,8 +1877,9 @@ class PixivDownloaderWorker(QRunnable):
                     _safe_emit(self.signals.log, f"🖼️ [{idx+1}/{total_new}] Fetching metadata for Bookmarked Illust ID {ill_id}...")
                 
                     illust_url = f"https://www.pixiv.net/ajax/illust/{ill_id}"
+                    r_ill = None
                     try:
-                        r_ill = requests.get(illust_url, headers=headers, timeout=15)
+                        r_ill = req.get(illust_url, headers=headers, timeout=15)
                         if r_ill.status_code == 200:
                             ill_data = r_ill.json()
                             if not ill_data.get('error'):
@@ -1831,6 +1947,10 @@ class PixivDownloaderWorker(QRunnable):
                                         return
                     except Exception as e:
                         _safe_emit(self.signals.log, f"   ❌ Error fetching details for Illust {ill_id}: {e}")
+                    finally:
+                        if r_ill is not None:
+                            try: r_ill.close()
+                            except Exception: pass
                 
                     _safe_emit(self.signals.progress, idx + 1, total_new)
                 

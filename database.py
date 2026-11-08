@@ -113,6 +113,7 @@ def get_file_tags(db_file, path):
         "is_favorite": False,
         "all": []
     }
+    conn = None
     try:
         conn = sqlite3.connect(db_file, timeout=5.0)
         cursor = conn.cursor()
@@ -134,9 +135,12 @@ def get_file_tags(db_file, path):
                     tags["custom"].append((tag_name, conf))
             elif category in (5, 9):
                 tags["rating"] = tag_name
-        conn.close()
     except Exception:
         pass
+    finally:
+        if conn is not None:
+            try: conn.close()
+            except Exception: pass
     return tags
 
 
@@ -144,15 +148,18 @@ def is_file_favorite(db_file, path) -> bool:
     """Checks if a file is marked as favorite (category=10, tag_name='favorite')."""
     if not path:
         return False
+    conn = None
     try:
         conn = sqlite3.connect(db_file, timeout=5.0)
         cursor = conn.cursor()
         cursor.execute("SELECT 1 FROM file_tags WHERE path = ? AND tag_name = 'favorite' AND category = 10 LIMIT 1", (path,))
-        res = cursor.fetchone() is not None
-        conn.close()
-        return res
+        return cursor.fetchone() is not None
     except Exception:
         return False
+    finally:
+        if conn is not None:
+            try: conn.close()
+            except Exception: pass
 
 
 def toggle_file_favorite(db_file, path, fav_state=None) -> bool:
@@ -162,6 +169,7 @@ def toggle_file_favorite(db_file, path, fav_state=None) -> bool:
     """
     if not path:
         return False
+    conn = None
     try:
         conn = sqlite3.connect(db_file, timeout=10.0)
         cursor = conn.cursor()
@@ -183,12 +191,15 @@ def toggle_file_favorite(db_file, path, fav_state=None) -> bool:
                 (path,)
             )
         conn.commit()
-        conn.close()
         invalidate_tag_stats_cache(db_file)
         return new_state
     except Exception as e:
         logging.error(f"Error toggling favorite for {path}: {e}")
         return False
+    finally:
+        if conn is not None:
+            try: conn.close()
+            except Exception: pass
 
 
 def add_custom_file_tag(db_file, path, tag_name: str, category: int = 11) -> bool:
@@ -200,6 +211,7 @@ def add_custom_file_tag(db_file, path, tag_name: str, category: int = 11) -> boo
     clean_tag = tag_name.strip().lower().replace(' ', '_')
     if not clean_tag or clean_tag == '__none__':
         return False
+    conn = None
     try:
         conn = sqlite3.connect(db_file, timeout=10.0)
         cursor = conn.cursor()
@@ -208,12 +220,15 @@ def add_custom_file_tag(db_file, path, tag_name: str, category: int = 11) -> boo
             (path, clean_tag, category)
         )
         conn.commit()
-        conn.close()
         invalidate_tag_stats_cache(db_file)
         return True
     except Exception as e:
         logging.error(f"Error adding custom tag '{clean_tag}' to {path}: {e}")
         return False
+    finally:
+        if conn is not None:
+            try: conn.close()
+            except Exception: pass
 
 
 def remove_file_tag(db_file, path, tag_name: str) -> bool:
@@ -221,17 +236,21 @@ def remove_file_tag(db_file, path, tag_name: str) -> bool:
     if not path or not tag_name:
         return False
     clean_tag = tag_name.strip().lower().replace(' ', '_')
+    conn = None
     try:
         conn = sqlite3.connect(db_file, timeout=10.0)
         cursor = conn.cursor()
         cursor.execute("DELETE FROM file_tags WHERE path = ? AND tag_name = ?", (path, clean_tag))
         conn.commit()
-        conn.close()
         invalidate_tag_stats_cache(db_file)
         return True
     except Exception as e:
         logging.error(f"Error removing tag '{clean_tag}' from {path}: {e}")
         return False
+    finally:
+        if conn is not None:
+            try: conn.close()
+            except Exception: pass
 
 
 def cleanup_orphaned_records(db_file=DB_FILE) -> dict:
@@ -240,6 +259,7 @@ def cleanup_orphaned_records(db_file=DB_FILE) -> dict:
     are no longer present in file_index (when file_index is populated).
     """
     removed = {"tags": 0, "thumbnails": 0, "orphaned_tags": 0, "orphaned_thumbnails": 0}
+    conn = None
     try:
         conn = sqlite3.connect(db_file, timeout=30.0)
         cursor = conn.cursor()
@@ -255,10 +275,13 @@ def cleanup_orphaned_records(db_file=DB_FILE) -> dict:
             removed["tags"] = g_cnt
             removed["orphaned_tags"] = g_cnt
             conn.commit()
-        conn.close()
         invalidate_tag_stats_cache(db_file)
     except Exception as e:
         logging.error(f"Error cleaning orphaned records: {e}")
+    finally:
+        if conn is not None:
+            try: conn.close()
+            except Exception: pass
     return removed
 
 
@@ -275,6 +298,7 @@ def get_all_characters(db_file, min_count=1, max_age_seconds=60):
         return list(_CHAR_CACHE[cache_key][1])
 
     chars = []
+    conn = None
     try:
         conn = sqlite3.connect(db_file, timeout=10.0)
         cursor = conn.cursor()
@@ -287,10 +311,13 @@ def get_all_characters(db_file, min_count=1, max_age_seconds=60):
             ORDER BY cnt DESC, tag_name ASC
         """, (min_count,))
         chars = [row[0] for row in cursor.fetchall()]
-        conn.close()
         _CHAR_CACHE[cache_key] = (now, chars)
     except Exception:
         pass
+    finally:
+        if conn is not None:
+            try: conn.close()
+            except Exception: pass
     return chars
 
 
@@ -302,6 +329,7 @@ def get_all_series(db_file, min_count=1, max_age_seconds=60):
         return list(_SERIES_CACHE[cache_key][1])
 
     series = []
+    conn = None
     try:
         conn = sqlite3.connect(db_file, timeout=10.0)
         cursor = conn.cursor()
@@ -314,10 +342,13 @@ def get_all_series(db_file, min_count=1, max_age_seconds=60):
             ORDER BY cnt DESC, tag_name ASC
         """, (min_count,))
         series = [row[0] for row in cursor.fetchall()]
-        conn.close()
         _SERIES_CACHE[cache_key] = (now, series)
     except Exception:
         pass
+    finally:
+        if conn is not None:
+            try: conn.close()
+            except Exception: pass
     return series
 
 
@@ -354,6 +385,7 @@ def get_tag_stats(db_file, force_refresh=False, max_age_seconds=60):
             return dict(_TAG_STATS_CACHE[db_file])
 
     stats = {"total_tagged_files": 0, "unique_characters": 0, "unique_tags": 0}
+    conn = None
     try:
         conn = sqlite3.connect(db_file, timeout=10.0)
         cursor = conn.cursor()
@@ -363,12 +395,15 @@ def get_tag_stats(db_file, force_refresh=False, max_age_seconds=60):
         stats["unique_characters"] = cursor.fetchone()[0] or 0
         cursor.execute("SELECT COUNT(DISTINCT tag_name) FROM file_tags WHERE tag_name != '__none__' AND category != 10")
         stats["unique_tags"] = cursor.fetchone()[0] or 0
-        conn.close()
 
         _TAG_STATS_CACHE[db_file] = stats
         _TAG_STATS_CACHE_TIME[db_file] = now
     except Exception:
         pass
+    finally:
+        if conn is not None:
+            try: conn.close()
+            except Exception: pass
     return stats
 
 
@@ -380,6 +415,7 @@ def get_all_search_suggestions(db_file, min_count=1, limit=2000, max_age_seconds
         return list(_SUGGESTIONS_CACHE[cache_key][1])
 
     suggestions = []
+    conn = None
     try:
         conn = sqlite3.connect(db_file, timeout=10.0)
         cursor = conn.cursor()
@@ -429,10 +465,13 @@ def get_all_search_suggestions(db_file, min_count=1, limit=2000, max_age_seconds
         except Exception:
             pass
 
-        conn.close()
         _SUGGESTIONS_CACHE[cache_key] = (now, suggestions)
     except Exception:
         pass
+    finally:
+        if conn is not None:
+            try: conn.close()
+            except Exception: pass
     return suggestions
 
 
@@ -453,6 +492,7 @@ def get_dashboard_analytics(db_file):
         "top_series": [],
         "top_tags": []
     }
+    conn = None
     try:
         conn = sqlite3.connect(db_file, timeout=15.0)
         cursor = conn.cursor()
@@ -533,8 +573,10 @@ def get_dashboard_analytics(db_file):
             LIMIT 60
         """)
         data["top_tags"] = cursor.fetchall()
-
-        conn.close()
     except Exception as e:
         logging.error(f"Error computing dashboard analytics: {e}")
+    finally:
+        if conn is not None:
+            try: conn.close()
+            except Exception: pass
     return data

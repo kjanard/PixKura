@@ -115,6 +115,7 @@ class PixivDownloadDialog(MinimizableDialog):
         # Real-time console log
         self.log_area = QTextEdit()
         self.log_area.setReadOnly(True)
+        self.log_area.document().setMaximumBlockCount(2000)
         self.log_area.setStyleSheet("background-color: #1a1a1f; color: #a7f3d0; font-family: Consolas; font-size: 11px;")
         layout.addWidget(self.log_area)
 
@@ -333,6 +334,13 @@ class PixivDownloadDialog(MinimizableDialog):
                 QMessageBox.information(self, "Download Cancelled", message)
             else:
                 QMessageBox.critical(self, "Error", f"Download failed: {message}")
+        if self.worker:
+            try: self.worker.signals.log.disconnect(self.add_log)
+            except Exception: pass
+            try: self.worker.signals.progress.disconnect(self.update_progress)
+            except Exception: pass
+            try: self.worker.signals.finished.disconnect(self.download_finished)
+            except Exception: pass
         self.worker = None
 
     def closeEvent(self, event):

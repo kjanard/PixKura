@@ -410,6 +410,7 @@ class _DatasetCountWorker(QThread):
         from query_parser import NSFW_ALL_FILTER_TAGS
         candidates = []
         nsfw_set = set()
+        conn = None
         try:
             conn = sqlite3.connect(self.db_file, timeout=10.0)
             self._conn = conn
@@ -435,13 +436,14 @@ class _DatasetCountWorker(QThread):
                     NSFW_ALL_FILTER_TAGS
                 )
                 nsfw_set = {r[0] for r in cursor.fetchall()}
-
-            self._conn = None
-            conn.close()
         except Exception:
-            self._conn = None
             if not candidates:
                 candidates = list(self.initial_paths)
+        finally:
+            self._conn = None
+            if conn is not None:
+                try: conn.close()
+                except Exception: pass
 
         if not self._is_cancelled:
             self.finished.emit(candidates, nsfw_set)
@@ -584,6 +586,7 @@ class DatasetExporterDialog(MinimizableDialog):
         """Fast (< 2 ms) indexed lookup when exporting a specific folder or small selection."""
         from query_parser import NSFW_ALL_FILTER_TAGS
         self._all_candidates = list(self.initial_file_paths)
+        conn = None
         try:
             conn = sqlite3.connect(self.db_file, timeout=5.0)
             cursor = conn.cursor()
@@ -594,9 +597,12 @@ class DatasetExporterDialog(MinimizableDialog):
                 tuple(self._all_candidates) + tuple(NSFW_ALL_FILTER_TAGS)
             )
             self._nsfw_set = {r[0] for r in cursor.fetchall()}
-            conn.close()
         except Exception:
             self._nsfw_set = set()
+        finally:
+            if conn is not None:
+                try: conn.close()
+                except Exception: pass
         self._candidates_loaded = True
         self._apply_filter_from_cache()
 
@@ -869,23 +875,28 @@ class DuplicateFinderDialog(MinimizableDialog):
             return
 
         deleted = 0
-        conn = sqlite3.connect(self.db_file, timeout=15.0)
-        cursor = conn.cursor()
-        for it in selected_items:
-            p = it.data(Qt.ItemDataRole.UserRole)
-            if p and os.path.exists(p):
-                try:
-                    os.remove(p)
-                    cursor.execute("DELETE FROM file_index WHERE path = ?", (p,))
-                    cursor.execute("DELETE FROM file_thumbnails WHERE path = ?", (p,))
-                    cursor.execute("DELETE FROM file_tags WHERE path = ?", (p,))
-                    row = self.list_results.row(it)
-                    self.list_results.takeItem(row)
-                    deleted += 1
-                except Exception:
-                    pass
-        conn.commit()
-        conn.close()
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_file, timeout=15.0)
+            cursor = conn.cursor()
+            for it in selected_items:
+                p = it.data(Qt.ItemDataRole.UserRole)
+                if p and os.path.exists(p):
+                    try:
+                        os.remove(p)
+                        cursor.execute("DELETE FROM file_index WHERE path = ?", (p,))
+                        cursor.execute("DELETE FROM file_thumbnails WHERE path = ?", (p,))
+                        cursor.execute("DELETE FROM file_tags WHERE path = ?", (p,))
+                        row = self.list_results.row(it)
+                        self.list_results.takeItem(row)
+                        deleted += 1
+                    except Exception:
+                        pass
+            conn.commit()
+        finally:
+            if conn is not None:
+                try: conn.close()
+                except Exception: pass
         self.lbl_status.setText(f"🗑️ ลบไฟล์ซ้ำเรียบร้อยแล้ว {deleted} ไฟล์")
 
     def closeEvent(self, event):
