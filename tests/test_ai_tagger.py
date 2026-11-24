@@ -657,6 +657,41 @@ class TestStreamScannerFiltering(unittest.TestCase):
         self.assertNotIn("D:\\art\\miku2.jpg", matched_paths)
         self.assertNotIn("D:\\art\\other2.png", matched_paths)
 
+    def test_cache_fast_path_and_cancel_never_deletes_index(self):
+        # 1. Cache-only unfiltered scan (like clicking Clear) completes immediately without disk walk
+        scanner = StreamScanner(
+            root="D:\\art",
+            db_file=self.temp_db_path,
+            gen_id=2,
+            use_cache=True,
+            sync_disk=False
+        )
+        results = []
+        finished_counts = []
+        scanner.signals.scan_batch.connect(lambda gid, batch: results.extend(batch))
+        scanner.signals.scan_finished.connect(lambda gid, cnt: finished_counts.append(cnt))
+        scanner.run()
+        self.assertEqual(len(results), 3)
+        self.assertEqual(finished_counts, [3])
+
+        # 2. Cancelled sync_disk scan MUST NOT delete existing DB rows
+        scanner_cancel = StreamScanner(
+            root="D:\\art",
+            db_file=self.temp_db_path,
+            gen_id=3,
+            use_cache=True,
+            sync_disk=True
+        )
+        scanner_cancel.stop()
+        scanner_cancel.run()
+
+        conn = sqlite3.connect(self.temp_db_path)
+        cnt_files = conn.execute("SELECT COUNT(*) FROM file_index").fetchone()[0]
+        cnt_tags = conn.execute("SELECT COUNT(*) FROM file_tags").fetchone()[0]
+        conn.close()
+        self.assertEqual(cnt_files, 3)
+        self.assertEqual(cnt_tags, 2)
+
 class TestAiTagDialogUI(unittest.TestCase):
     def test_dialog_components(self):
         dialog = AiTagDialog()

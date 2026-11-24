@@ -95,7 +95,7 @@ class PixivManagerApp(QMainWindow):
         self.bg_pool = QThreadPool(); self.bg_pool.setMaxThreadCount(min(6, max(4, os.cpu_count()))) 
         self.fg_pool = QThreadPool(); self.fg_pool.setMaxThreadCount(min(4, max(2, os.cpu_count() // 2)))
         self.api_pool = QThreadPool(); self.api_pool.setMaxThreadCount(1)
-        self.scan_pool = QThreadPool(); self.scan_pool.setMaxThreadCount(1)
+        self.scan_pool = QThreadPool(); self.scan_pool.setMaxThreadCount(2)
         
         self.current_folder = ""; self.config = {}
         self.folder_queue = []; self.file_queue = []
@@ -586,7 +586,7 @@ class PixivManagerApp(QMainWindow):
 
     def start_scan_all_files(self, folder, use_cache=True, filter_mode='ALL',
                              min_size=None, max_size=None, min_mtime=None, search_keyword=None,
-                             tag_filter=None, parsed_query=None, rating_filter='ALL'):
+                             tag_filter=None, parsed_query=None, rating_filter='ALL', sync_disk=False):
         self.files_model.update_data([])
         self.all_scanned_files = []
         self.file_item_map.clear()
@@ -606,7 +606,8 @@ class PixivManagerApp(QMainWindow):
         
         self.scan_worker = StreamScanner(folder, DB_FILE, self.scan_gen_id, use_cache, filter_mode,
                                          min_size, max_size, min_mtime, search_keyword, tag_filter,
-                                         parsed_query=parsed_query, rating_filter=rating_filter)
+                                         parsed_query=parsed_query, rating_filter=rating_filter,
+                                         sync_disk=sync_disk)
         self.scan_worker.signals.scan_batch.connect(self.handle_stream_batch); self.scan_worker.signals.scan_finished.connect(self.handle_stream_finished)
         self.scan_pool.start(self.scan_worker); self.scan_timer.start()
 
@@ -685,7 +686,8 @@ class PixivManagerApp(QMainWindow):
                                       min_size=min_size, max_size=max_size, min_mtime=min_mtime,
                                       search_keyword=None,
                                       parsed_query=parsed_q,
-                                      rating_filter=active_rating)
+                                      rating_filter=active_rating,
+                                      sync_disk=True)
 
     @pyqtSlot(int, list)
     def handle_stream_batch(self, gen_id, batch_files):
@@ -1315,13 +1317,25 @@ class PixivManagerApp(QMainWindow):
                                       rating_filter=active_rating)
 
     def clear_search(self):
-        self.search_input.clear()
-        self.size_filter.setCurrentIndex(0)
-        self.date_filter.setCurrentIndex(0)
+        # Block combo signals while resetting filters so perform_search() only fires ONCE
+        widgets = [self.size_filter, self.date_filter]
         if hasattr(self, 'char_filter'):
-            self.char_filter.setCurrentIndex(0)
+            widgets.append(self.char_filter)
         if hasattr(self, 'rating_filter'):
-            self.rating_filter.setCurrentIndex(0)
+            widgets.append(self.rating_filter)
+        for w in widgets:
+            w.blockSignals(True)
+        try:
+            self.search_input.clear()
+            self.size_filter.setCurrentIndex(0)
+            self.date_filter.setCurrentIndex(0)
+            if hasattr(self, 'char_filter'):
+                self.char_filter.setCurrentIndex(0)
+            if hasattr(self, 'rating_filter'):
+                self.rating_filter.setCurrentIndex(0)
+        finally:
+            for w in widgets:
+                w.blockSignals(False)
         self.perform_search()
 
     def open_ai_tag_dialog(self, specific_folder=None, artist_name=None):

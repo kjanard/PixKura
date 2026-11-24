@@ -745,10 +745,11 @@ class ImageLoaderWorker(QRunnable):
 class StreamScanner(QRunnable):
     def __init__(self, root, db_file, gen_id, use_cache=True, filter_mode='ALL',
                  min_size=None, max_size=None, min_mtime=None, search_keyword=None,
-                 tag_filter=None, parsed_query=None, rating_filter='ALL'):
+                 tag_filter=None, parsed_query=None, rating_filter='ALL', sync_disk=False):
         super().__init__()
         self.root = root; self.db_file = db_file; self.gen_id = gen_id
         self.use_cache = use_cache; self.filter_mode = filter_mode
+        self.sync_disk = bool(sync_disk) or (not use_cache)
         self.min_size = min_size; self.max_size = max_size
         self.min_mtime = min_mtime; self.search_keyword = search_keyword
         self.tag_filter = tag_filter
@@ -890,41 +891,72 @@ class StreamScanner(QRunnable):
                 logging.error(f"Error filtering by tag: {e}")
                 self.matched_tag_paths = set()
 
+        if not self.running:
+            return
+
         # 1. Fetch all files currently in DB under this root
         db_files = {} # path -> (size, mtime, ctime)
+        root_has_index = False
         try:
             search_prefix = self.root + os.sep
             search_prefix_upper = self.root + os.sep + "\uffff"
             try:
                 cursor.execute("SELECT path, size, mtime, ctime FROM file_index WHERE path >= ? AND path < ?", (search_prefix, search_prefix_upper))
-                for row in cursor.fetchall():
+                rows = cursor.fetchall()
+                root_has_index = len(rows) > 0
+                for row in rows:
+                    if not self.running:
+                        return
                     if self.matched_tag_paths is not None and row[0] not in self.matched_tag_paths:
                         continue
                     db_files[row[0]] = (row[1], row[2], row[3] if len(row) > 3 and row[3] is not None else 0.0)
             except sqlite3.OperationalError:
                 cursor.execute("SELECT path, size, mtime FROM file_index WHERE path >= ? AND path < ?", (search_prefix, search_prefix_upper))
-                for row in cursor.fetchall():
+                rows = cursor.fetchall()
+                root_has_index = len(rows) > 0
+                for row in rows:
+                    if not self.running:
+                        return
                     if self.matched_tag_paths is not None and row[0] not in self.matched_tag_paths:
                         continue
                     db_files[row[0]] = (row[1], row[2], 0.0)
         except Exception as e:
             pass
 
+        if not self.running:
+            return
+
         seen_on_disk = set()
         new_or_updated = []
         ui_batch = []; batch_size = 500
+        emitted_count = 0
 
         # If using cache, immediately send the existing DB entries to the UI
         if self.use_cache:
             db_list = []
             for path, (size, mtime, ctime) in db_files.items():
+                if not self.running:
+                    return
                 if self.check_filter(os.path.basename(path), filepath=path, fsize=size, fmtime=mtime):
                     db_list.append((path, size, mtime, ctime))
+                    emitted_count += 1
                     if len(db_list) >= batch_size:
                         _safe_emit(self.signals.scan_batch, self.gen_id, db_list)
                         db_list = []
-            if db_list:
+            if db_list and self.running:
                 _safe_emit(self.signals.scan_batch, self.gen_id, db_list)
+
+        if not self.running:
+            return
+
+        # Fast-path: When searching/filtering/clearing with cache on an already-indexed folder,
+        # return immediately from SQLite instead of walking 270k+ files on HDD every time.
+        # Disk walk only runs on explicit Rescan (sync_disk=True) or first-time unindexed folder.
+        should_walk_disk = self.sync_disk or (not root_has_index)
+        if not should_walk_disk:
+            _safe_emit(self.signals.scan_finished, self.gen_id, emitted_count)
+            _safe_emit(self.signals.api_log, f"โหลดรายการเสร็จสิ้น พบไฟล์ทั้งหมด {emitted_count:,} ไฟล์")
+            return
 
         # 2. Walk directory to find additions and modifications
         for r, d, f in os.walk(self.root):
@@ -967,12 +999,17 @@ class StreamScanner(QRunnable):
                         self.save_batch_to_db(cursor, new_or_updated)
                         new_or_updated = []
 
+        # CRITICAL SAFETY GUARD: If cancelled mid-walk, abort immediately without
+        # touching Step 3 (otherwise unseen DB rows would be falsely treated as deleted!).
+        if not self.running:
+            return
+
         if ui_batch:
             _safe_emit(self.signals.scan_batch, self.gen_id, ui_batch)
         if new_or_updated:
             self.save_batch_to_db(cursor, new_or_updated)
 
-        # 3. Clean up deleted files from SQLite index (only when not filtering by subset)
+        # 3. Clean up deleted files from SQLite index (only when full walk completed without cancellation)
         deleted_paths = []
         is_unfiltered_scan = (
             self.filter_mode == 'ALL'
@@ -989,11 +1026,13 @@ class StreamScanner(QRunnable):
             ))
         )
         for path in db_files.keys():
+            if not self.running:
+                return
             if path not in seen_on_disk:
                 if is_unfiltered_scan or not os.path.exists(path):
                     deleted_paths.append((path,))
 
-        if deleted_paths:
+        if deleted_paths and self.running:
             try:
                 for i in range(0, len(deleted_paths), 500):
                     batch_del = deleted_paths[i:i+500]
@@ -1003,6 +1042,9 @@ class StreamScanner(QRunnable):
                 conn.commit()
             except Exception as e:
                 pass
+
+        if not self.running:
+            return
 
         conn.commit()
         total_count = len(seen_on_disk)
