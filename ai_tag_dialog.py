@@ -475,9 +475,19 @@ class AiTagDialog(MinimizableDialog):
             self.btn_download_model.setVisible(False)
             self.btn_start.setEnabled(True)
         else:
-            self.model_status_label.setText(f"⚠️ ยังไม่ได้ดาวน์โหลด {model_name} (กดดาวน์โหลดก่อนใช้งาน)")
+            if model_meta.get("is_ensemble"):
+                missing = [
+                    AVAILABLE_AI_MODELS.get(k, {}).get("short_name", k)
+                    for k in model_meta.get("ensemble_keys", [])
+                    if not WD14Tagger.is_model_installed(k)
+                ]
+                missing_txt = ", ".join(missing) if missing else size_hint
+                self.model_status_label.setText(f"⚠️ ขาดโมเดลย่อยอีก {len(missing)} ตัว ({missing_txt})")
+                self.btn_download_model.setText(f"📥 ดาวน์โหลดโมเดลที่ขาด ({len(missing)} ตัว)")
+            else:
+                self.model_status_label.setText(f"⚠️ ยังไม่ได้ดาวน์โหลด {model_name} (กดดาวน์โหลดก่อนใช้งาน)")
+                self.btn_download_model.setText(f"📥 ดาวน์โหลด {model_name} ({size_hint})")
             self.model_status_label.setStyleSheet("color: #f59e0b; font-weight: bold;")
-            self.btn_download_model.setText(f"📥 ดาวน์โหลด {model_name} ({size_hint})")
             self.btn_download_model.setVisible(True)
             self.btn_start.setEnabled(False)
 

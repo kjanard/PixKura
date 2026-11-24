@@ -292,7 +292,91 @@ class TestWD14Tagger(unittest.TestCase):
         self.assertEqual(paths_ultra["meta"]["ensemble_keys"], ["wd-v3-eva02-large", "wd-v3-swinv2", "wd-v3-convnext"])
         tagger_ultra = WD14Tagger("wd-v3-ultra-ensemble")
         self.assertTrue(tagger_ultra.is_ensemble)
+        self.assertFalse(tagger_ultra.is_heterogeneous)
         self.assertEqual(tagger_ultra.ensemble_keys, ["wd-v3-eva02-large", "wd-v3-swinv2", "wd-v3-convnext"])
+
+        # Test All Best Model in One (heterogeneous 3-in-1)
+        paths_all_best = get_model_paths("all-best-ensemble")
+        self.assertTrue(paths_all_best["meta"]["is_ensemble"])
+        self.assertTrue(paths_all_best["meta"]["is_heterogeneous"])
+        self.assertEqual(
+            paths_all_best["meta"]["ensemble_keys"],
+            ["wd-v3-eva02-large", "pixai-tagger-v0.9", "camie-tagger-v2"]
+        )
+        tagger_all_best = WD14Tagger("all-best-ensemble")
+        self.assertTrue(tagger_all_best.is_ensemble)
+        self.assertTrue(tagger_all_best.is_heterogeneous)
+        specs = tagger_all_best.get_sub_preprocess_specs()
+        self.assertEqual(len(specs), 3)
+        self.assertEqual([s[4] for s in specs], ["wd", "pixai", "camie"])
+        self.assertEqual([s[1] for s in specs], [448, 448, 512])
+
+    def test_13_all_best_heterogeneous_fusion_and_multi_decode(self):
+        from workers import decode_image_cv2_multi
+
+        # 1. Test single-decode OpenCV multi-tensor generation for All Best 3-in-1
+        fd_img, img_path = tempfile.mkstemp(suffix=".png")
+        os.close(fd_img)
+        try:
+            img = Image.new("RGB", (600, 400), (200, 100, 50))
+            img.save(img_path)
+
+            all_best = WD14Tagger("all-best-ensemble", use_gpu=False)
+            specs = all_best.get_sub_preprocess_specs()
+            cv2_dict = decode_image_cv2_multi(img_path, specs)
+            self.assertIsNotNone(cv2_dict)
+            self.assertEqual(cv2_dict["wd-v3-eva02-large"].shape, (1, 448, 448, 3))
+            self.assertEqual(cv2_dict["pixai-tagger-v0.9"].shape, (1, 3, 448, 448))
+            self.assertEqual(cv2_dict["camie-tagger-v2"].shape, (1, 3, 512, 512))
+
+            pil_dict = all_best.prepare_media_tensor(img_path)
+            self.assertIsNotNone(pil_dict)
+            self.assertEqual(pil_dict["wd-v3-eva02-large"].shape, (1, 448, 448, 3))
+            self.assertEqual(pil_dict["pixai-tagger-v0.9"].shape, (1, 3, 448, 448))
+            self.assertEqual(pil_dict["camie-tagger-v2"].shape, (1, 3, 512, 512))
+        finally:
+            if os.path.exists(img_path):
+                try: os.remove(img_path)
+                except OSError: pass
+
+        # 2. Test cross-vocabulary fusion (union + consensus boost + explicit rating priority)
+        res_eva = {
+            "characters": [("hatsune_miku", 0.85)],
+            "series": [("vocaloid", 0.90)],
+            "general": [("1girl", 0.95), ("twintails", 0.80)],
+            "rating": "sensitive",
+            "all_tags": [("hatsune_miku", 4, 0.85), ("vocaloid", 3, 0.90), ("1girl", 0, 0.95), ("twintails", 0, 0.80), ("sensitive", 5, 0.88)]
+        }
+        res_pixai = {
+            "characters": [("hatsune_miku", 0.90), ("new_2026_char", 0.89)],
+            "series": [("vocaloid", 0.90), ("new_2026_game", 0.89)],
+            "general": [("1girl", 0.96)],
+            "rating": "general",  # fallback rating (explicit flag=False)
+            "all_tags": [("hatsune_miku", 4, 0.90), ("new_2026_char", 4, 0.89), ("vocaloid", 3, 0.90), ("new_2026_game", 3, 0.89), ("1girl", 0, 0.96), ("general", 5, 0.90)]
+        }
+        res_camie = {
+            "characters": [("hatsune_miku", 0.88)],
+            "series": [("vocaloid", 0.87)],
+            "general": [("1girl", 0.94), ("rare_camie_detail", 0.72)],
+            "rating": "sensitive",
+            "all_tags": [("hatsune_miku", 4, 0.88), ("vocaloid", 3, 0.87), ("1girl", 0, 0.94), ("rare_camie_detail", 0, 0.72), ("sensitive", 5, 0.82)]
+        }
+        merged = WD14Tagger._merge_heterogeneous_results(
+            [res_eva, res_pixai, res_camie],
+            has_explicit_rating_flags=[True, False, True]
+        )
+        char_map = dict(merged["characters"])
+        series_map = dict(merged["series"])
+        gen_map = dict(merged["general"])
+        # Consensus tag ranks highest (0.90 + 2*0.02 = 0.94)
+        self.assertAlmostEqual(char_map["hatsune_miku"], 0.94, places=3)
+        # Brand-new character known only to PixAI is preserved with full confidence!
+        self.assertAlmostEqual(char_map["new_2026_char"], 0.89, places=3)
+        self.assertIn("new_2026_game", series_map)
+        # Rare Camie tag is preserved!
+        self.assertAlmostEqual(gen_map["rare_camie_detail"], 0.72, places=3)
+        # Explicit rating heads (EVA02 + Camie) win over PixAI's fallback rating
+        self.assertEqual(merged["rating"], "sensitive")
 
 
 class TestDatabaseLayer(unittest.TestCase):

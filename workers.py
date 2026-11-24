@@ -234,37 +234,8 @@ def convert_frames_to_mp4(pil_frames, durations, mp4_filepath):
         return False
 
 
-def decode_image_cv2_for_wd14(path, target_size=448, target_dtype=np.float32, nchw=False, preprocess_mode="wd"):
-    """
-    Fast C++ OpenCV image decoder & preprocessor for AI Taggers (WD14 / WD v3, PixAI v0.9, Camie v2).
-    Properly handles 4-channel RGBA/BGRA transparency (compositing onto a white background)
-    and 2D grayscale images, matching WD14Tagger.preprocess_image.
-    """
-    if not _CV2_AVAILABLE or _cv2 is None:
-        return None
-    raw = np.fromfile(path, dtype=np.uint8)
-    img = _cv2.imdecode(raw, _cv2.IMREAD_UNCHANGED)
-    if img is None:
-        return None
-
-    if img.ndim == 2:
-        img = _cv2.cvtColor(img, _cv2.COLOR_GRAY2BGR)
-    elif img.ndim == 3 and img.shape[2] == 4:
-        if img.dtype == np.uint16:
-            img = (img / 256).astype(np.uint8)
-        b_ch, g_ch, r_ch, a_ch = _cv2.split(img)
-        alpha = a_ch.astype(np.float32) / 255.0
-        inv_alpha = 1.0 - alpha
-        b = (b_ch.astype(np.float32) * alpha + 255.0 * inv_alpha).astype(np.uint8)
-        g = (g_ch.astype(np.float32) * alpha + 255.0 * inv_alpha).astype(np.uint8)
-        r = (r_ch.astype(np.float32) * alpha + 255.0 * inv_alpha).astype(np.uint8)
-        img = _cv2.merge((b, g, r))
-    elif img.ndim == 3 and img.shape[2] > 3:
-        img = img[:, :, :3]
-
-    if img.dtype == np.uint16:
-        img = (img / 256).astype(np.uint8)
-
+def _cv2_bgr_to_tensor(img, target_size=448, target_dtype=np.float32, nchw=False, preprocess_mode="wd"):
+    """Converts an already-decoded 3-channel uint8 BGR image into an AI tagger input tensor."""
     h, w = img.shape[:2]
     if h <= 0 or w <= 0:
         return None
@@ -306,6 +277,66 @@ def decode_image_cv2_for_wd14(path, target_size=448, target_dtype=np.float32, nc
     if nchw:
         padded = np.transpose(padded, (2, 0, 1))
     return np.expand_dims(padded, axis=0)
+
+
+def _decode_bgr_cv2(path):
+    """Decodes an image file via OpenCV with RGBA white-background compositing and grayscale handling."""
+    if not _CV2_AVAILABLE or _cv2 is None:
+        return None
+    raw = np.fromfile(path, dtype=np.uint8)
+    img = _cv2.imdecode(raw, _cv2.IMREAD_UNCHANGED)
+    if img is None:
+        return None
+
+    if img.ndim == 2:
+        img = _cv2.cvtColor(img, _cv2.COLOR_GRAY2BGR)
+    elif img.ndim == 3 and img.shape[2] == 4:
+        if img.dtype == np.uint16:
+            img = (img / 256).astype(np.uint8)
+        b_ch, g_ch, r_ch, a_ch = _cv2.split(img)
+        alpha = a_ch.astype(np.float32) / 255.0
+        inv_alpha = 1.0 - alpha
+        b = (b_ch.astype(np.float32) * alpha + 255.0 * inv_alpha).astype(np.uint8)
+        g = (g_ch.astype(np.float32) * alpha + 255.0 * inv_alpha).astype(np.uint8)
+        r = (r_ch.astype(np.float32) * alpha + 255.0 * inv_alpha).astype(np.uint8)
+        img = _cv2.merge((b, g, r))
+    elif img.ndim == 3 and img.shape[2] > 3:
+        img = img[:, :, :3]
+
+    if img.dtype == np.uint16:
+        img = (img / 256).astype(np.uint8)
+    return img
+
+
+def decode_image_cv2_for_wd14(path, target_size=448, target_dtype=np.float32, nchw=False, preprocess_mode="wd"):
+    """
+    Fast C++ OpenCV image decoder & preprocessor for AI Taggers (WD14 / WD v3, PixAI v0.9, Camie v2).
+    Properly handles 4-channel RGBA/BGRA transparency (compositing onto a white background)
+    and 2D grayscale images, matching WD14Tagger.preprocess_image.
+    """
+    img = _decode_bgr_cv2(path)
+    if img is None:
+        return None
+    return _cv2_bgr_to_tensor(img, target_size=target_size, target_dtype=target_dtype, nchw=nchw, preprocess_mode=preprocess_mode)
+
+
+def decode_image_cv2_multi(path, sub_specs):
+    """
+    Single-decode OpenCV fast-path for heterogeneous ensembles (e.g. All Best 3-in-1):
+    Reads and decodes the image from disk ONCE, then produces each sub-model's exact input tensor.
+    sub_specs: list of (model_key, target_size, target_dtype, nchw, preprocess_mode).
+    Returns dict {model_key: tensor} or None.
+    """
+    img = _decode_bgr_cv2(path)
+    if img is None:
+        return None
+    result = {}
+    for model_key, t_size, t_dtype, is_nchw, p_mode in sub_specs:
+        t = _cv2_bgr_to_tensor(img, target_size=t_size, target_dtype=t_dtype, nchw=is_nchw, preprocess_mode=p_mode)
+        if t is None:
+            return None
+        result[model_key] = t
+    return result
 
 
 class WorkerSignals(QObject):
@@ -2245,10 +2276,12 @@ class AiTaggingWorker(QRunnable):
         batch_tags = []
 
         # Determine model input size, dtype, preprocess_mode, and NCHW flag dynamically
+        is_heterogeneous = getattr(tagger, "is_heterogeneous", False)
+        sub_specs = tagger.get_sub_preprocess_specs() if is_heterogeneous else []
         preprocess_mode = getattr(tagger, "preprocess_mode", "wd")
         target_size = getattr(tagger, "default_input_size", 448)
         is_nchw = preprocess_mode in ("pixai", "camie")
-        if len(tagger.input_shape) == 4:
+        if not is_heterogeneous and len(tagger.input_shape) == 4:
             if tagger.input_shape[1] == 3:
                 is_nchw = True
                 if isinstance(tagger.input_shape[2], int) and tagger.input_shape[2] > 3:
@@ -2258,7 +2291,7 @@ class AiTaggingWorker(QRunnable):
         target_dtype = tagger.input_dtype
 
         # Multi-threaded Producer-Consumer Prefetch Pipeline
-        prefetch_queue = queue.Queue(maxsize=INFERENCE_BATCH * 8)  # Deep buffer: always have next batch ready
+        prefetch_queue = queue.Queue(maxsize=INFERENCE_BATCH * (4 if is_heterogeneous else 8))
         idx_queue = queue.Queue()
         for idx, fp in enumerate(target_files):
             idx_queue.put((idx, fp))
@@ -2282,13 +2315,16 @@ class AiTaggingWorker(QRunnable):
                     elif _CV2_AVAILABLE:
                         ext = os.path.splitext(path)[1].lower()
                         if ext in ('.jpg', '.jpeg', '.png', '.webp', '.bmp'):
-                            tensor = decode_image_cv2_for_wd14(
-                                path,
-                                target_size=target_size,
-                                target_dtype=target_dtype,
-                                nchw=is_nchw,
-                                preprocess_mode=preprocess_mode
-                            )
+                            if is_heterogeneous:
+                                tensor = decode_image_cv2_multi(path, sub_specs)
+                            else:
+                                tensor = decode_image_cv2_for_wd14(
+                                    path,
+                                    target_size=target_size,
+                                    target_dtype=target_dtype,
+                                    nchw=is_nchw,
+                                    preprocess_mode=preprocess_mode
+                                )
                             if tensor is None:
                                 tensor = tagger.prepare_media_tensor(path)
                         else:
@@ -2351,7 +2387,13 @@ class AiTaggingWorker(QRunnable):
             if valid_items:
                 try:
                     fps_list, tensors = zip(*valid_items)
-                    stacked = np.concatenate(tensors, axis=0)
+                    if isinstance(tensors[0], dict):
+                        stacked = {
+                            k: np.concatenate([td[k] for td in tensors], axis=0)
+                            for k in tensors[0].keys()
+                        }
+                    else:
+                        stacked = np.concatenate(tensors, axis=0)
                     batch_results = tagger.predict_tensor_batch(
                         stacked,
                         char_threshold=self.char_threshold,

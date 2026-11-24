@@ -75,6 +75,7 @@ class WD14Tagger:
         paths = get_model_paths(self.model_key)
         self.meta = paths["meta"]
         self.is_ensemble = self.meta.get("is_ensemble", False)
+        self.is_heterogeneous = self.meta.get("is_heterogeneous", False)
         self.ensemble_keys = self.meta.get("ensemble_keys", [])
         self.preprocess_mode = self.meta.get("preprocess_mode", "wd")
         self.output_index = int(self.meta.get("output_index", 0))
@@ -574,12 +575,147 @@ class WD14Tagger:
         img_array = np.expand_dims(img_array, axis=0)
         return img_array
 
+    def get_sub_preprocess_specs(self):
+        """
+        Returns a list of (model_key, target_size, input_dtype, is_nchw, preprocess_mode)
+        for each sub-model in a heterogeneous ensemble so OpenCV can decode each image once
+        and generate all required input tensors in one pass.
+        """
+        specs = []
+        source_taggers = self.sub_taggers if self.sub_taggers else [
+            WD14Tagger(k, use_gpu=self.use_gpu, use_fp16=self.use_fp16) for k in self.ensemble_keys
+        ]
+        for sub in source_taggers:
+            target_size = sub.default_input_size
+            is_nchw = sub.preprocess_mode in ("pixai", "camie")
+            if len(sub.input_shape) == 4:
+                if sub.input_shape[1] == 3:
+                    is_nchw = True
+                    if isinstance(sub.input_shape[2], int) and sub.input_shape[2] > 3:
+                        target_size = sub.input_shape[2]
+                elif isinstance(sub.input_shape[1], int) and sub.input_shape[1] > 3:
+                    target_size = sub.input_shape[1]
+            specs.append((sub.model_key, target_size, sub.input_dtype, is_nchw, sub.preprocess_mode))
+        return specs
+
+    @staticmethod
+    def _merge_heterogeneous_results(per_model_results, has_explicit_rating_flags=None):
+        """
+        Fuses predictions from heterogeneous models with different vocabularies
+        (e.g., WD v3 EVA02-Large + PixAI v0.9 + Camie v2):
+        - Takes union of detected tags across all sub-models so newer/rare characters
+          known only to PixAI or Camie are never suppressed by older vocabularies.
+        - Uses max confidence with a small consensus boost (+0.02 per extra agreeing model,
+          capped at 0.999) so tags agreed upon by multiple architectures rank highest.
+        - Prioritizes models with explicit trained rating classes (WD v3 / Camie v2)
+          when selecting the final content rating.
+        """
+        valid_entries = [
+            (res, has_explicit_rating_flags[i] if has_explicit_rating_flags and i < len(has_explicit_rating_flags) else True)
+            for i, res in enumerate(per_model_results)
+            if res is not None
+        ]
+        if not valid_entries:
+            return None
+
+        char_scores = {}    # name -> [confs]
+        series_scores = {}  # name -> [confs]
+        gen_scores = {}     # name -> [confs]
+        explicit_rating_votes = {}  # rating_name -> [confs]
+        fallback_rating_votes = {}  # rating_name -> [confs]
+
+        for res, has_explicit_rating in valid_entries:
+            for name, conf in res.get("characters", []):
+                char_scores.setdefault(name, []).append(float(conf))
+            for name, conf in res.get("series", []):
+                series_scores.setdefault(name, []).append(float(conf))
+            for name, conf in res.get("general", []):
+                gen_scores.setdefault(name, []).append(float(conf))
+
+            # Find rating confidence from all_tags (cat 5)
+            r_name = res.get("rating", "general")
+            r_conf = 0.5
+            for t_name, t_cat, t_conf in res.get("all_tags", []):
+                if t_cat == 5 and t_name == r_name:
+                    r_conf = float(t_conf)
+                    break
+            target_votes = explicit_rating_votes if has_explicit_rating else fallback_rating_votes
+            target_votes.setdefault(r_name, []).append(r_conf)
+
+        def _fuse_bucket(bucket_dict, cat_id):
+            fused = []
+            tags_cat = []
+            for name, confs in bucket_dict.items():
+                best = max(confs)
+                votes = len(confs)
+                score = min(0.999, best + 0.02 * (votes - 1)) if votes > 1 else best
+                fused.append((name, score))
+                tags_cat.append((name, cat_id, score))
+            fused.sort(key=lambda x: x[1], reverse=True)
+            return fused, tags_cat
+
+        characters, char_tags = _fuse_bucket(char_scores, 4)
+        series, series_tags = _fuse_bucket(series_scores, 3)
+        general, gen_tags = _fuse_bucket(gen_scores, 0)
+        all_tags = char_tags + series_tags + gen_tags
+
+        # Rating fusion: prefer explicit trained rating heads; break ties conservatively
+        rating_pool = explicit_rating_votes if explicit_rating_votes else fallback_rating_votes
+        rating = "general"
+        rating_conf = 0.90
+        if rating_pool:
+            severity_order = {"general": 0, "sensitive": 1, "questionable": 2, "explicit": 3}
+            best_r = max(
+                rating_pool.items(),
+                key=lambda kv: (sum(kv[1]), severity_order.get(kv[0], 0))
+            )
+            rating = best_r[0]
+            rating_conf = max(best_r[1])
+        all_tags.append((rating, 5, rating_conf))
+
+        return {
+            "characters": characters,
+            "series": series,
+            "general": general,
+            "rating": rating,
+            "all_tags": all_tags
+        }
+
     def prepare_media_tensor(self, media_path):
         """
-        Loads and pre-processes a media file into a GPU-ready float32/float16 tensor.
+        Loads and pre-processes a media file into a GPU-ready float32/float16 tensor
+        (or a dict of {sub_model_key: tensor} for heterogeneous ensembles).
         Ideal for multi-threaded async prefetching pipeline.
         """
         if self.is_ensemble:
+            if self.is_heterogeneous:
+                try:
+                    pil_img, _ = load_media_thumbnail(media_path)
+                    if pil_img is None or pil_img.size == (0, 0):
+                        return None
+                    source_taggers = self.sub_taggers if self.sub_taggers else [
+                        WD14Tagger(k, use_gpu=self.use_gpu, use_fp16=self.use_fp16) for k in self.ensemble_keys
+                    ]
+                    tensor_dict = {}
+                    try:
+                        for sub in source_taggers:
+                            t_size = sub.default_input_size
+                            if len(sub.input_shape) == 4:
+                                if isinstance(sub.input_shape[1], int) and sub.input_shape[1] > 3:
+                                    t_size = sub.input_shape[1]
+                                elif isinstance(sub.input_shape[2], int) and sub.input_shape[2] > 3:
+                                    t_size = sub.input_shape[2]
+                            tensor_dict[sub.model_key] = sub.preprocess_image(pil_img, target_size=t_size)
+                    finally:
+                        try:
+                            pil_img.close()
+                        except Exception:
+                            pass
+                    return tensor_dict
+                except Exception as e:
+                    logging.debug(f"Error preparing heterogeneous tensors for {media_path}: {e}")
+                    return None
+
             if self.sub_taggers:
                 return self.sub_taggers[0].prepare_media_tensor(media_path)
             first_sub = WD14Tagger(self.ensemble_keys[0], use_gpu=self.use_gpu, use_fp16=self.use_fp16)
@@ -709,6 +845,19 @@ class WD14Tagger:
             if input_data is None:
                 return None
 
+            if self.is_heterogeneous:
+                per_model_results = []
+                explicit_flags = []
+                for sub in self.sub_taggers:
+                    sub_input = input_data.get(sub.model_key) if isinstance(input_data, dict) else input_data
+                    if sub_input is None:
+                        continue
+                    per_model_results.append(
+                        sub.predict_tensor(sub_input, char_threshold=char_threshold, gen_threshold=gen_threshold)
+                    )
+                    explicit_flags.append(bool(sub.rating_indices))
+                return self._merge_heterogeneous_results(per_model_results, explicit_flags)
+
             all_probs = []
             for sub in self.sub_taggers:
                 t = input_data.astype(sub.input_dtype) if input_data.dtype != sub.input_dtype else input_data
@@ -759,6 +908,28 @@ class WD14Tagger:
 
             if batch_tensor is None or len(batch_tensor) == 0:
                 return []
+
+            if self.is_heterogeneous and isinstance(batch_tensor, dict):
+                per_model_batches = []
+                explicit_flags = []
+                batch_len = 0
+                for sub in self.sub_taggers:
+                    sub_batch = batch_tensor.get(sub.model_key)
+                    if sub_batch is None or len(sub_batch) == 0:
+                        continue
+                    batch_len = len(sub_batch)
+                    per_model_batches.append(
+                        sub.predict_tensor_batch(sub_batch, char_threshold=char_threshold, gen_threshold=gen_threshold)
+                    )
+                    explicit_flags.append(bool(sub.rating_indices))
+
+                if not per_model_batches or batch_len == 0:
+                    return []
+
+                return [
+                    self._merge_heterogeneous_results([mb[i] for mb in per_model_batches], explicit_flags)
+                    for i in range(batch_len)
+                ]
 
             all_batch_probs = []
             for sub in self.sub_taggers:

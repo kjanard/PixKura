@@ -312,6 +312,20 @@ AVAILABLE_AI_MODELS = {
         "is_ensemble": True,
         "ensemble_keys": ["wd-v3-eva02-large", "wd-v3-swinv2", "wd-v3-convnext"],
         "legacy": False
+    },
+    "all-best-ensemble": {
+        "id": "all-best-ensemble",
+        "name": "🌌 All Best Model in One (รวมสุดยอด 3 ค่าย: WD v3 EVA02 + PixAI v0.9 + Camie v2 🔥)",
+        "short_name": "All Best 3-in-1 (EVA02 + PixAI + Camie)",
+        "repo": "PixKura/all-best-ensemble",
+        "model_url": "",
+        "tags_url": "",
+        "subdir": "all_best_ensemble",
+        "size_hint": "~3.2 GB",
+        "is_ensemble": True,
+        "is_heterogeneous": True,
+        "ensemble_keys": ["wd-v3-eva02-large", "pixai-tagger-v0.9", "camie-tagger-v2"],
+        "legacy": False
     }
 }
 DEFAULT_MODEL_KEY = "wd-v1-4-convnext-v2"
