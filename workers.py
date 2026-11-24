@@ -234,9 +234,9 @@ def convert_frames_to_mp4(pil_frames, durations, mp4_filepath):
         return False
 
 
-def decode_image_cv2_for_wd14(path, target_size=448, target_dtype=np.float32, nchw=False):
+def decode_image_cv2_for_wd14(path, target_size=448, target_dtype=np.float32, nchw=False, preprocess_mode="wd"):
     """
-    Fast C++ OpenCV image decoder & preprocessor for WD14 Tagger.
+    Fast C++ OpenCV image decoder & preprocessor for AI Taggers (WD14 / WD v3, PixAI v0.9, Camie v2).
     Properly handles 4-channel RGBA/BGRA transparency (compositing onto a white background)
     and 2D grayscale images, matching WD14Tagger.preprocess_image.
     """
@@ -268,6 +268,31 @@ def decode_image_cv2_for_wd14(path, target_size=448, target_dtype=np.float32, nc
     h, w = img.shape[:2]
     if h <= 0 or w <= 0:
         return None
+
+    if preprocess_mode == "pixai":
+        rgb = _cv2.cvtColor(img, _cv2.COLOR_BGR2RGB)
+        resized = _cv2.resize(rgb, (target_size, target_size), interpolation=_cv2.INTER_LINEAR)
+        arr = (resized.astype(np.float32) * (1.0 / 127.5) - 1.0).astype(target_dtype)
+        arr = np.transpose(arr, (2, 0, 1))
+        return np.expand_dims(arr, axis=0)
+
+    if preprocess_mode == "camie":
+        rgb = _cv2.cvtColor(img, _cv2.COLOR_BGR2RGB)
+        scale = target_size / max(h, w)
+        nw = max(1, int(w * scale))
+        nh = max(1, int(h * scale))
+        interp = _cv2.INTER_AREA if scale < 1.0 else _cv2.INTER_CUBIC
+        resized = _cv2.resize(rgb, (nw, nh), interpolation=interp)
+        padded = np.empty((target_size, target_size, 3), dtype=np.uint8)
+        padded[:, :] = (124, 116, 104)
+        px = (target_size - nw) // 2
+        py = (target_size - nh) // 2
+        padded[py:py+nh, px:px+nw] = resized
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        arr = ((padded.astype(np.float32) / 255.0 - mean) / std).astype(target_dtype)
+        arr = np.transpose(arr, (2, 0, 1))
+        return np.expand_dims(arr, axis=0)
 
     scale = target_size / max(h, w)
     nw = max(1, int(w * scale))
@@ -2219,9 +2244,10 @@ class AiTaggingWorker(QRunnable):
         error_count = 0
         batch_tags = []
 
-        # Determine model input size, dtype, and NCHW flag dynamically
-        target_size = 448
-        is_nchw = False
+        # Determine model input size, dtype, preprocess_mode, and NCHW flag dynamically
+        preprocess_mode = getattr(tagger, "preprocess_mode", "wd")
+        target_size = getattr(tagger, "default_input_size", 448)
+        is_nchw = preprocess_mode in ("pixai", "camie")
         if len(tagger.input_shape) == 4:
             if tagger.input_shape[1] == 3:
                 is_nchw = True
@@ -2260,7 +2286,8 @@ class AiTaggingWorker(QRunnable):
                                 path,
                                 target_size=target_size,
                                 target_dtype=target_dtype,
-                                nchw=is_nchw
+                                nchw=is_nchw,
+                                preprocess_mode=preprocess_mode
                             )
                             if tensor is None:
                                 tensor = tagger.prepare_media_tensor(path)

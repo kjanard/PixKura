@@ -466,7 +466,9 @@ class AiTagDialog(MinimizableDialog):
     def on_model_changed(self, idx):
         model_key = self.combo_model.currentData() or DEFAULT_MODEL_KEY
         is_installed = WD14Tagger.is_model_installed(model_key)
-        model_name = AVAILABLE_AI_MODELS.get(model_key, {}).get("short_name", model_key)
+        model_meta = AVAILABLE_AI_MODELS.get(model_key, {})
+        model_name = model_meta.get("short_name", model_key)
+        size_hint = model_meta.get("size_hint", "~370 MB")
         if is_installed:
             self.model_status_label.setText(f"✅ ติดตั้งโมเดล {model_name} เรียบร้อยพร้อมใช้งาน")
             self.model_status_label.setStyleSheet("color: #10b981; font-weight: bold;")
@@ -475,7 +477,7 @@ class AiTagDialog(MinimizableDialog):
         else:
             self.model_status_label.setText(f"⚠️ ยังไม่ได้ดาวน์โหลด {model_name} (กดดาวน์โหลดก่อนใช้งาน)")
             self.model_status_label.setStyleSheet("color: #f59e0b; font-weight: bold;")
-            self.btn_download_model.setText(f"📥 ดาวน์โหลด {model_name} (~370 MB)")
+            self.btn_download_model.setText(f"📥 ดาวน์โหลด {model_name} ({size_hint})")
             self.btn_download_model.setVisible(True)
             self.btn_start.setEnabled(False)
 

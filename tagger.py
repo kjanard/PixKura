@@ -1,5 +1,6 @@
 import os
 import csv
+import json
 import logging
 import requests
 import numpy as np
@@ -50,7 +51,8 @@ def get_model_paths(model_key=DEFAULT_MODEL_KEY):
 
     model_fp32 = os.path.join(model_dir, "model.onnx")
     model_fp16 = os.path.join(model_dir, "model_fp16.onnx")
-    tags_csv = os.path.join(model_dir, "selected_tags.csv")
+    tags_filename = meta.get("tags_filename", "selected_tags.csv")
+    tags_csv = os.path.join(model_dir, tags_filename)
     return {
         "key": model_key,
         "dir": model_dir,
@@ -62,7 +64,8 @@ def get_model_paths(model_key=DEFAULT_MODEL_KEY):
 
 class WD14Tagger:
     """
-    Local AI Tagger supporting WD14 Tagger (v1.4), WD Tagger v3 Series, and Ensemble 3-in-1 in ONNX format.
+    Local AI Tagger supporting WD14 Tagger (v1.4), WD Tagger v3 Series, PixAI Tagger v0.9,
+    Camie Tagger v2, and Ensemble 3-in-1 in ONNX format.
     Supports GPU & NPU acceleration via DirectML, CUDA, OpenVINO, QNN, FP16 Half-Precision, and CPU fallback.
     """
     def __init__(self, model_key=DEFAULT_MODEL_KEY, model_path=None, tags_path=None, use_gpu=True, use_fp16=False):
@@ -73,6 +76,10 @@ class WD14Tagger:
         self.meta = paths["meta"]
         self.is_ensemble = self.meta.get("is_ensemble", False)
         self.ensemble_keys = self.meta.get("ensemble_keys", [])
+        self.preprocess_mode = self.meta.get("preprocess_mode", "wd")
+        self.output_index = int(self.meta.get("output_index", 0))
+        self.default_input_size = int(self.meta.get("input_size", 448))
+        self.has_ips_mapping = False
         self.sub_taggers = []
 
         if not self.is_ensemble:
@@ -90,13 +97,16 @@ class WD14Tagger:
             self.tags_path = paths["tags_csv"]
 
         self.session = None
-        self.tags_data = [] # List of dict: {id, name, category, count}
+        self.tags_data = [] # List of dict: {id, name, category, count, ips}
         self.char_indices = []
         self.series_indices = []
         self.general_indices = []
         self.rating_indices = []
         self.input_name = None
-        self.input_shape = [1, 448, 448, 3] # Default shape [1, 448, 448, 3]
+        if self.preprocess_mode in ("pixai", "camie"):
+            self.input_shape = [1, 3, self.default_input_size, self.default_input_size]
+        else:
+            self.input_shape = [1, self.default_input_size, self.default_input_size, 3]
         self.input_dtype = np.float16 if self.use_fp16 else np.float32
         self.output_name = None
         self.active_provider = None
@@ -148,14 +158,20 @@ class WD14Tagger:
         try:
             model = onnx.load(src_path)
             try:
-                # Ensure dynamic batch size is set on input & output
+                # Ensure dynamic batch size is set on input & outputs if currently fixed
+                patched = False
                 inp = model.graph.input[0]
-                inp.type.tensor_type.shape.dim[0].dim_value = 0
-                inp.type.tensor_type.shape.dim[0].dim_param = 'batch_size'
-                out = model.graph.output[0]
-                out.type.tensor_type.shape.dim[0].dim_value = 0
-                out.type.tensor_type.shape.dim[0].dim_param = 'batch_size'
-                onnx.save(model, src_path)
+                if len(inp.type.tensor_type.shape.dim) > 0 and not inp.type.tensor_type.shape.dim[0].dim_param:
+                    inp.type.tensor_type.shape.dim[0].dim_value = 0
+                    inp.type.tensor_type.shape.dim[0].dim_param = 'batch_size'
+                    patched = True
+                for out in model.graph.output:
+                    if len(out.type.tensor_type.shape.dim) > 0 and not out.type.tensor_type.shape.dim[0].dim_param:
+                        out.type.tensor_type.shape.dim[0].dim_value = 0
+                        out.type.tensor_type.shape.dim[0].dim_param = 'batch_size'
+                        patched = True
+                if patched:
+                    onnx.save(model, src_path)
             except Exception as e:
                 logging.debug(f"Dynamic batch patch on source: {e}")
 
@@ -234,8 +250,9 @@ class WD14Tagger:
         target_dir = paths["dir"]
         os.makedirs(target_dir, exist_ok=True)
 
+        tags_fname = os.path.basename(paths["tags_csv"])
         files = [
-            ("selected_tags.csv", meta["tags_url"], paths["tags_csv"]),
+            (tags_fname, meta["tags_url"], paths["tags_csv"]),
             ("model.onnx", meta["model_url"], paths["model_fp32"])
         ]
 
@@ -246,22 +263,28 @@ class WD14Tagger:
                 continue
 
             resp = requests.get(url, stream=True, timeout=30)
-            resp.raise_for_status()
-            total_size = int(resp.headers.get('content-length', 0))
-            downloaded = 0
+            try:
+                resp.raise_for_status()
+                total_size = int(resp.headers.get('content-length', 0))
+                downloaded = 0
 
-            with open(temp_path, 'wb') as f:
-                for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                    if cancel_check and cancel_check():
-                        f.close()
-                        if os.path.exists(temp_path):
-                            os.remove(temp_path)
-                        raise InterruptedError("Download cancelled by user.")
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if progress_callback:
-                            progress_callback(downloaded, total_size, f"กำลังดาวน์โหลด {meta['short_name']} ({filename})...")
+                with open(temp_path, 'wb') as f:
+                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                        if cancel_check and cancel_check():
+                            f.close()
+                            if os.path.exists(temp_path):
+                                os.remove(temp_path)
+                            raise InterruptedError("Download cancelled by user.")
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            if progress_callback:
+                                progress_callback(downloaded, total_size, f"กำลังดาวน์โหลด {meta['short_name']} ({filename})...")
+            finally:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
 
             if total_size > 0 and downloaded != total_size:
                 if os.path.exists(temp_path):
@@ -287,7 +310,12 @@ class WD14Tagger:
         return True
 
     def load_tags(self):
-        """Loads and parses selected_tags.csv."""
+        """
+        Loads and parses tag metadata:
+        - SmilingWolf WD CSV (tag_id, name, category, count)
+        - PixAI v0.9 CSV (id, tag_id, name, category, count, ips) with automatic character->series IP mapping
+        - Camie Tagger v2 JSON metadata (idx_to_tag, tag_to_category)
+        """
         if not os.path.exists(self.tags_path):
             raise FileNotFoundError(f"ไม่พบไฟล์แท็ก: {self.tags_path}")
 
@@ -296,23 +324,99 @@ class WD14Tagger:
         self.series_indices = []
         self.general_indices = []
         self.rating_indices = []
+        self.has_ips_mapping = False
+
+        if self.tags_path.lower().endswith(".json"):
+            with open(self.tags_path, mode='r', encoding='utf-8') as f:
+                metadata = json.load(f)
+            dataset_info = metadata.get("dataset_info", {})
+            tag_mapping = dataset_info.get("tag_mapping", {})
+            idx_to_tag = tag_mapping.get("idx_to_tag", {})
+            tag_to_category = tag_mapping.get("tag_to_category", {})
+            total_tags = int(dataset_info.get("total_tags", len(idx_to_tag)))
+
+            cat_str_to_int = {
+                "general": 0,
+                "copyright": 3,
+                "character": 4,
+                "rating": 5,
+            }
+            rating_name_map = {
+                "rating_general": "general",
+                "rating_sensitive": "sensitive",
+                "rating_questionable": "questionable",
+                "rating_explicit": "explicit",
+            }
+
+            for idx in range(total_tags):
+                raw_name = idx_to_tag.get(str(idx), idx_to_tag.get(idx, ""))
+                cat_str = tag_to_category.get(raw_name, "")
+                category = cat_str_to_int.get(cat_str, -1)
+                name = rating_name_map.get(raw_name, raw_name) if category == 5 else raw_name
+
+                tag_item = {
+                    "index": idx,
+                    "id": idx,
+                    "name": name,
+                    "category": category,
+                    "count": 0,
+                    "ips": []
+                }
+                self.tags_data.append(tag_item)
+
+                if category == 4:
+                    self.char_indices.append(idx)
+                elif category == 3:
+                    self.series_indices.append(idx)
+                elif category == 0:
+                    self.general_indices.append(idx)
+                elif category == 5:
+                    self.rating_indices.append(idx)
+
+            logging.info(
+                f"Loaded {len(self.tags_data)} JSON tags "
+                f"({len(self.char_indices)} characters, {len(self.series_indices)} series, {len(self.rating_indices)} ratings)."
+            )
+            return
 
         with open(self.tags_path, mode='r', encoding='utf-8') as f:
             reader = csv.reader(f)
-            header = next(reader, None)
+            header = next(reader, None) or []
+            header_lower = [h.strip().lower() for h in header]
+
+            col_id = header_lower.index("tag_id") if "tag_id" in header_lower else 0
+            col_name = header_lower.index("name") if "name" in header_lower else 1
+            col_cat = header_lower.index("category") if "category" in header_lower else 2
+            col_count = header_lower.index("count") if "count" in header_lower else 3
+            col_ips = header_lower.index("ips") if "ips" in header_lower else -1
+
+            min_cols = max(col_name, col_cat) + 1
             for idx, row in enumerate(reader):
-                if not row or len(row) < 3: continue
-                tag_id = int(row[0]) if row[0].isdigit() else idx
-                name = row[1]
-                category = int(row[2]) if row[2].isdigit() else 0
-                count = int(row[3]) if len(row) > 3 and row[3].isdigit() else 0
+                if not row or len(row) < min_cols:
+                    continue
+                tag_id = int(row[col_id]) if col_id < len(row) and row[col_id].isdigit() else idx
+                name = row[col_name]
+                category = int(row[col_cat]) if row[col_cat].isdigit() else 0
+                count = int(row[col_count]) if col_count < len(row) and row[col_count].isdigit() else 0
+
+                ips_list = []
+                if col_ips >= 0 and col_ips < len(row) and row[col_ips]:
+                    try:
+                        parsed_ips = json.loads(row[col_ips])
+                        if isinstance(parsed_ips, list) and parsed_ips:
+                            ips_list = [str(ip).strip() for ip in parsed_ips if str(ip).strip()]
+                            if ips_list:
+                                self.has_ips_mapping = True
+                    except Exception:
+                        ips_list = []
 
                 tag_item = {
                     "index": idx,
                     "id": tag_id,
                     "name": name,
                     "category": category, # 0: General, 3: Copyright/Series, 4: Character, 5: Rating
-                    "count": count
+                    "count": count,
+                    "ips": ips_list
                 }
                 self.tags_data.append(tag_item)
 
@@ -325,7 +429,10 @@ class WD14Tagger:
                 elif category in (5, 9) or name in ('general', 'sensitive', 'questionable', 'explicit'):
                     self.rating_indices.append(idx)
 
-        logging.info(f"Loaded {len(self.tags_data)} tags ({len(self.char_indices)} characters, {len(self.series_indices)} series).")
+        logging.info(
+            f"Loaded {len(self.tags_data)} tags ({len(self.char_indices)} characters, "
+            f"{len(self.series_indices)} series, ips_mapping={self.has_ips_mapping})."
+        )
 
     def load_model(self):
         """Initializes ONNX Runtime InferenceSession with DirectML/CUDA/NPU or CPU."""
@@ -372,11 +479,13 @@ class WD14Tagger:
                 self.session = ort.InferenceSession(paths["model_fp16"], sess_options=sess_options, providers=providers)
                 self.active_provider = self.session.get_providers()[0]
                 inputs = self.session.get_inputs()
+                outputs = self.session.get_outputs()
+                out_idx = self.output_index if self.output_index < len(outputs) else 0
                 self.input_name = inputs[0].name
                 self.input_shape = inputs[0].shape
                 self.input_dtype = np.float16 if "float16" in inputs[0].type else np.float32
-                self.output_name = self.session.get_outputs()[0].name
-                logging.info(f"Initialized WD14Tagger on {self.active_provider} (FP16). Input: {self.input_name} {self.input_shape} ({self.input_dtype})")
+                self.output_name = outputs[out_idx].name
+                logging.info(f"Initialized WD14Tagger on {self.active_provider} (FP16). Input: {self.input_name} {self.input_shape} ({self.input_dtype}) -> Output: {self.output_name}")
                 return
             except Exception as e:
                 logging.warning(f"FP16 load failed for {self.model_key} ({e}), falling back to FP32 DirectML...")
@@ -388,11 +497,13 @@ class WD14Tagger:
         self.session = ort.InferenceSession(paths["model_fp32"], sess_options=sess_options, providers=providers)
         self.active_provider = self.session.get_providers()[0]
         inputs = self.session.get_inputs()
+        outputs = self.session.get_outputs()
+        out_idx = self.output_index if self.output_index < len(outputs) else 0
         self.input_name = inputs[0].name
         self.input_shape = inputs[0].shape
         self.input_dtype = np.float16 if "float16" in inputs[0].type else np.float32
-        self.output_name = self.session.get_outputs()[0].name
-        logging.info(f"Initialized WD14Tagger on {self.active_provider} (FP32). Input: {self.input_name} {self.input_shape} ({self.input_dtype})")
+        self.output_name = outputs[out_idx].name
+        logging.info(f"Initialized WD14Tagger on {self.active_provider} (FP32). Input: {self.input_name} {self.input_shape} ({self.input_dtype}) -> Output: {self.output_name}")
 
     def unload(self):
         """Releases ONNX Runtime InferenceSession and GPU / NPU device memory buffers."""
@@ -403,13 +514,18 @@ class WD14Tagger:
             self.sub_taggers = []
         self.session = None
 
-    def preprocess_image(self, pil_image, target_size=448):
+    def preprocess_image(self, pil_image, target_size=None):
         """
-        Preprocesses PIL Image for WD14 Tagger:
+        Preprocesses PIL Image for AI Tagger:
         - Alpha composition with white background for transparent PNGs
-        - Fast Bilinear resize with aspect ratio preserved and padded to target_size (square)
-        - Format: BGR float32 or float16 array normalized according to ConvNeXt specs
+        - 'wd': Aspect-ratio preserve + white padding, BGR [0..255]
+        - 'pixai': Direct bilinear resize to 448x448, RGB normalized to [-1, 1], NCHW
+        - 'camie': Aspect-ratio LANCZOS resize + ImageNet mean (124,116,104) padding to 512x512,
+                   RGB ImageNet normalized, NCHW
         """
+        if target_size is None:
+            target_size = self.default_input_size
+
         if pil_image.mode in ('RGBA', 'LA') or (pil_image.mode == 'P' and hasattr(pil_image, 'info') and 'transparency' in pil_image.info):
             canvas = Image.new('RGB', pil_image.size, (255, 255, 255))
             pil_image = pil_image.convert('RGBA')
@@ -417,6 +533,27 @@ class WD14Tagger:
             pil_image = canvas
         else:
             pil_image = pil_image.convert('RGB')
+
+        if self.preprocess_mode == "pixai":
+            resized = pil_image.resize((target_size, target_size), Image.Resampling.BILINEAR)
+            img_array = (np.asarray(resized, dtype=np.float32) * (1.0 / 127.5) - 1.0).astype(self.input_dtype)
+            img_array = np.transpose(img_array, (2, 0, 1))
+            return np.expand_dims(img_array, axis=0)
+
+        if self.preprocess_mode == "camie":
+            w, h = pil_image.size
+            scale = target_size / max(w, h)
+            new_w, new_h = max(1, int(w * scale)), max(1, int(h * scale))
+            resized = pil_image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            padded = Image.new('RGB', (target_size, target_size), (124, 116, 104))
+            paste_x = (target_size - new_w) // 2
+            paste_y = (target_size - new_h) // 2
+            padded.paste(resized, (paste_x, paste_y))
+            mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+            std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+            img_array = ((np.asarray(padded, dtype=np.float32) / 255.0 - mean) / std).astype(self.input_dtype)
+            img_array = np.transpose(img_array, (2, 0, 1))
+            return np.expand_dims(img_array, axis=0)
 
         w, h = pil_image.size
         scale = target_size / max(w, h)
@@ -453,17 +590,111 @@ class WD14Tagger:
             if pil_img is None or pil_img.size == (0, 0):
                 return None
 
-            target_size = 448
+            target_size = self.default_input_size
             if len(self.input_shape) == 4:
                 if isinstance(self.input_shape[1], int) and self.input_shape[1] > 3:
                     target_size = self.input_shape[1]
                 elif isinstance(self.input_shape[2], int) and self.input_shape[2] > 3:
                     target_size = self.input_shape[2]
 
-            return self.preprocess_image(pil_img, target_size=target_size)
+            try:
+                return self.preprocess_image(pil_img, target_size=target_size)
+            finally:
+                try:
+                    pil_img.close()
+                except Exception:
+                    pass
         except Exception as e:
             logging.debug(f"Error preparing tensor for {media_path}: {e}")
             return None
+
+    def _extract_tags_from_probs(self, probs, char_threshold, gen_threshold):
+        """
+        Converts probability/logit vector into structured characters, series, general, rating, and all_tags.
+        - Applies numerically stable sigmoid if raw logits are detected.
+        - Automatically infers Series/Copyright tags from character `ips` metadata (PixAI v0.9).
+        - Infers fallback rating from explicit/sensitive general tags if model has no explicit rating class.
+        """
+        probs = probs.astype(np.float32)
+        if probs.size > 0 and (np.max(probs) > 1.0 or np.min(probs) < 0.0):
+            probs = 1.0 / (1.0 + np.exp(-np.clip(probs, -60.0, 60.0)))
+
+        characters = []
+        series = []
+        general = []
+        all_tags = []
+        seen_series = {}
+        inferred_series = {}
+
+        min_thresh = min(char_threshold, gen_threshold, 0.20)
+        passing_indices = np.flatnonzero(probs >= min_thresh)
+        num_tags = len(self.tags_data)
+
+        for idx in passing_indices:
+            if idx >= num_tags:
+                continue
+            tag_info = self.tags_data[idx]
+            cat = tag_info["category"]
+            conf = float(probs[idx])
+            name = tag_info["name"]
+
+            if cat == 4 and conf >= char_threshold:
+                characters.append((name, conf))
+                all_tags.append((name, 4, conf))
+                # Automatic Character -> Series/IP mapping (e.g. PixAI Tagger v0.9 `ips` column)
+                for ip_name in tag_info.get("ips", ()):
+                    if ip_name and conf > inferred_series.get(ip_name, 0.0):
+                        inferred_series[ip_name] = conf
+            elif cat == 3 and conf >= char_threshold:
+                if conf > seen_series.get(name, 0.0):
+                    seen_series[name] = conf
+                series.append((name, conf))
+                all_tags.append((name, 3, conf))
+            elif cat == 0 and conf >= gen_threshold:
+                general.append((name, conf))
+                all_tags.append((name, 0, conf))
+
+        # Merge auto-mapped IP/Series tags without duplicating directly detected series
+        for ip_name, ip_conf in inferred_series.items():
+            if ip_name not in seen_series:
+                series.append((ip_name, ip_conf))
+                all_tags.append((ip_name, 3, ip_conf))
+
+        # Rating (Category 5)
+        rating = "general"
+        if self.rating_indices:
+            valid_rating_indices = [i for i in self.rating_indices if i < probs.size]
+            if valid_rating_indices:
+                best_rating_idx = max(valid_rating_indices, key=lambda i: probs[i])
+                rating = self.tags_data[best_rating_idx]["name"]
+                all_tags.append((rating, 5, float(probs[best_rating_idx])))
+        else:
+            # Smart rating inference for models without rating classes (e.g. PixAI v0.9)
+            try:
+                from query_parser import NSFW_EXPLICIT_TAGS, SENSITIVE_ECCHI_TAGS
+                gen_names = {g[0] for g in general}
+                if gen_names & set(NSFW_EXPLICIT_TAGS):
+                    rating = "explicit"
+                    all_tags.append(("explicit", 5, 0.85))
+                elif gen_names & set(SENSITIVE_ECCHI_TAGS):
+                    rating = "sensitive"
+                    all_tags.append(("sensitive", 5, 0.75))
+                else:
+                    all_tags.append(("general", 5, 0.90))
+            except Exception:
+                all_tags.append(("general", 5, 0.90))
+
+        characters.sort(key=lambda x: x[1], reverse=True)
+        series.sort(key=lambda x: x[1], reverse=True)
+        general.sort(key=lambda x: x[1], reverse=True)
+
+        return {
+            "characters": characters,
+            "series": series,
+            "general": general,
+            "rating": rating,
+            "all_tags": all_tags
+        }
 
     def predict_tensor(self, input_data, char_threshold=DEFAULT_CHARACTER_THRESHOLD,
                        gen_threshold=DEFAULT_GENERAL_THRESHOLD):
@@ -484,7 +715,7 @@ class WD14Tagger:
                 outputs = sub.session.run([sub.output_name], {sub.input_name: t})
                 sub_probs = outputs[0][0].astype(np.float32)
                 if np.max(sub_probs) > 1.0 or np.min(sub_probs) < 0.0:
-                    sub_probs = 1.0 / (1.0 + np.exp(-sub_probs))
+                    sub_probs = 1.0 / (1.0 + np.exp(-np.clip(sub_probs, -60.0, 60.0)))
                 all_probs.append(sub_probs)
             probs = np.mean(all_probs, axis=0)
         else:
@@ -500,55 +731,9 @@ class WD14Tagger:
 
             # Run ONNX inference
             outputs = self.session.run([self.output_name], {self.input_name: input_data})
-            probs = outputs[0][0].astype(np.float32)
+            probs = outputs[0][0]
 
-            # Apply sigmoid if raw logits were returned
-            if np.max(probs) > 1.0 or np.min(probs) < 0.0:
-                probs = 1.0 / (1.0 + np.exp(-probs))
-
-        characters = []
-        series = []
-        general = []
-        all_tags = []
-
-        min_thresh = min(char_threshold, gen_threshold, 0.20)
-        passing_indices = np.flatnonzero(probs >= min_thresh)
-
-        for idx in passing_indices:
-            tag_info = self.tags_data[idx]
-            cat = tag_info["category"]
-            conf = float(probs[idx])
-            name = tag_info["name"]
-
-            if cat == 4 and conf >= char_threshold:
-                characters.append((name, conf))
-                all_tags.append((name, 4, conf))
-            elif cat == 3 and conf >= char_threshold:
-                series.append((name, conf))
-                all_tags.append((name, 3, conf))
-            elif cat == 0 and conf >= gen_threshold:
-                general.append((name, conf))
-                all_tags.append((name, 0, conf))
-
-        # 4. Rating (Category 5)
-        rating = "general"
-        if self.rating_indices:
-            best_rating_idx = max(self.rating_indices, key=lambda i: probs[i])
-            rating = self.tags_data[best_rating_idx]["name"]
-            all_tags.append((rating, 5, float(probs[best_rating_idx])))
-
-        # Sort by confidence descending
-        characters.sort(key=lambda x: x[1], reverse=True)
-        series.sort(key=lambda x: x[1], reverse=True)
-        general.sort(key=lambda x: x[1], reverse=True)
-
-        return {
-            "characters": characters,
-            "series": series,
-            "general": general,
-            "rating": rating,
-            "all_tags": all_tags
-        }
+        return self._extract_tags_from_probs(probs, char_threshold=char_threshold, gen_threshold=gen_threshold)
 
     def predict(self, media_path, char_threshold=DEFAULT_CHARACTER_THRESHOLD,
                 gen_threshold=DEFAULT_GENERAL_THRESHOLD):
@@ -564,7 +749,7 @@ class WD14Tagger:
                              gen_threshold=DEFAULT_GENERAL_THRESHOLD):
         """
         Batched GPU Inference: runs N images through ONNX in a single GPU call.
-        batch_tensor shape: (N, H, W, C) — stacked by np.concatenate().
+        batch_tensor shape: (N, H, W, C) or (N, C, H, W) — stacked by np.concatenate().
         Returns a list of N result dicts (same format as predict_tensor).
         Supports single model and Ensemble (Soft-Voting probability average).
         """
@@ -581,7 +766,7 @@ class WD14Tagger:
                 outputs = sub.session.run([sub.output_name], {sub.input_name: t})
                 sub_probs = outputs[0].astype(np.float32)
                 if np.max(sub_probs) > 1.0 or np.min(sub_probs) < 0.0:
-                    sub_probs = 1.0 / (1.0 + np.exp(-sub_probs))
+                    sub_probs = 1.0 / (1.0 + np.exp(-np.clip(sub_probs, -60.0, 60.0)))
                 all_batch_probs.append(sub_probs)
 
             batch_probs = np.mean(all_batch_probs, axis=0)  # shape: (N, num_tags)
@@ -618,54 +803,7 @@ class WD14Tagger:
                     probs_list.append(out[0][0])
                 batch_probs = np.array(probs_list)
 
-        min_thresh = min(char_threshold, gen_threshold, 0.20)
-        results = []
-
-        for probs in batch_probs:
-            probs = probs.astype(np.float32)
-
-            # Apply sigmoid if raw logits were returned
-            if np.max(probs) > 1.0 or np.min(probs) < 0.0:
-                probs = 1.0 / (1.0 + np.exp(-probs))
-
-            characters = []
-            series = []
-            general = []
-            all_tags = []
-
-            passing_indices = np.flatnonzero(probs >= min_thresh)
-            for idx in passing_indices:
-                tag_info = self.tags_data[idx]
-                cat = tag_info["category"]
-                conf = float(probs[idx])
-                name = tag_info["name"]
-
-                if cat == 4 and conf >= char_threshold:
-                    characters.append((name, conf))
-                    all_tags.append((name, 4, conf))
-                elif cat == 3 and conf >= char_threshold:
-                    series.append((name, conf))
-                    all_tags.append((name, 3, conf))
-                elif cat == 0 and conf >= gen_threshold:
-                    general.append((name, conf))
-                    all_tags.append((name, 0, conf))
-
-            rating = "general"
-            if self.rating_indices:
-                best_rating_idx = max(self.rating_indices, key=lambda i: probs[i])
-                rating = self.tags_data[best_rating_idx]["name"]
-                all_tags.append((rating, 5, float(probs[best_rating_idx])))
-
-            characters.sort(key=lambda x: x[1], reverse=True)
-            series.sort(key=lambda x: x[1], reverse=True)
-            general.sort(key=lambda x: x[1], reverse=True)
-
-            results.append({
-                "characters": characters,
-                "series": series,
-                "general": general,
-                "rating": rating,
-                "all_tags": all_tags
-            })
-
-        return results
+        return [
+            self._extract_tags_from_probs(probs, char_threshold=char_threshold, gen_threshold=gen_threshold)
+            for probs in batch_probs
+        ]

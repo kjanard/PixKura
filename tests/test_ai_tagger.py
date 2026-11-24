@@ -127,6 +127,8 @@ class TestWD14Tagger(unittest.TestCase):
         self.assertIn("wd-v3-swinv2", AVAILABLE_AI_MODELS)
         self.assertIn("wd-v3-eva02-large", AVAILABLE_AI_MODELS)
         self.assertIn("wd-v3-vit-large", AVAILABLE_AI_MODELS)
+        self.assertIn("pixai-tagger-v0.9", AVAILABLE_AI_MODELS)
+        self.assertIn("camie-tagger-v2", AVAILABLE_AI_MODELS)
         self.assertIn("wd-v3-ensemble", AVAILABLE_AI_MODELS)
         self.assertIn("wd-v3-ultra-ensemble", AVAILABLE_AI_MODELS)
         
@@ -137,6 +139,141 @@ class TestWD14Tagger(unittest.TestCase):
         paths_eva = get_model_paths("wd-v3-eva02-large")
         self.assertIn("wd_v3_eva02_large", paths_eva["dir"])
         self.assertTrue(paths_eva["model_fp32"].endswith("model.onnx"))
+
+        paths_pixai = get_model_paths("pixai-tagger-v0.9")
+        self.assertIn("pixai_tagger_v0_9", paths_pixai["dir"])
+        self.assertTrue(paths_pixai["tags_csv"].endswith("selected_tags.csv"))
+        self.assertEqual(paths_pixai["meta"]["preprocess_mode"], "pixai")
+
+        paths_camie = get_model_paths("camie-tagger-v2")
+        self.assertIn("camie_tagger_v2", paths_camie["dir"])
+        self.assertTrue(paths_camie["tags_csv"].endswith("camie-tagger-v2-metadata.json"))
+        self.assertEqual(paths_camie["meta"]["preprocess_mode"], "camie")
+        self.assertEqual(paths_camie["meta"]["output_index"], 1)
+
+    def test_11_pixai_v09_csv_ips_mapping_and_preprocess(self):
+        import json
+        from workers import decode_image_cv2_for_wd14
+
+        fd, csv_path = tempfile.mkstemp(suffix=".csv")
+        os.close(fd)
+        fd_img, img_path = tempfile.mkstemp(suffix=".png")
+        os.close(fd_img)
+        try:
+            with open(csv_path, "w", encoding="utf-8", newline="") as f:
+                f.write("id,tag_id,name,category,count,ips\n")
+                f.write("0,470575,1girl,0,6893309,[]\n")
+                f.write("1,12345,nude,0,500000,[]\n")
+                f.write('2,1478495,artoria_pendragon_(fate),4,41941,"[""fate_(series)"", ""fate/stay_night""]"\n')
+
+            tagger = WD14Tagger(model_key="pixai-tagger-v0.9", tags_path=csv_path, use_gpu=False)
+            tagger.load_tags()
+            self.assertEqual(len(tagger.tags_data), 3)
+            self.assertTrue(tagger.has_ips_mapping)
+            self.assertEqual(tagger.tags_data[2]["ips"], ["fate_(series)", "fate/stay_night"])
+
+            # Verify automatic Series/IP extraction + fallback rating inference
+            probs = np.array([0.95, 0.10, 0.88], dtype=np.float32)
+            res = tagger._extract_tags_from_probs(probs, char_threshold=0.35, gen_threshold=0.35)
+            self.assertEqual(res["characters"][0][0], "artoria_pendragon_(fate)")
+            series_names = [s[0] for s in res["series"]]
+            self.assertIn("fate_(series)", series_names)
+            self.assertIn("fate/stay_night", series_names)
+            self.assertEqual(res["rating"], "general")
+
+            # Verify explicit rating fallback when NSFW general tag fires
+            probs_nsfw = np.array([0.95, 0.90, 0.10], dtype=np.float32)
+            res_nsfw = tagger._extract_tags_from_probs(probs_nsfw, char_threshold=0.35, gen_threshold=0.35)
+            self.assertEqual(res_nsfw["rating"], "explicit")
+
+            # Verify PIL & OpenCV preprocessing match NCHW [1, 3, 448, 448] in [-1, 1]
+            img = Image.new("RGB", (300, 200), (255, 0, 128))
+            img.save(img_path)
+            arr_pil = tagger.preprocess_image(img, target_size=448)
+            self.assertEqual(arr_pil.shape, (1, 3, 448, 448))
+            self.assertAlmostEqual(float(arr_pil[0, 0, 0, 0]), 1.0, places=3)   # R=255 -> +1.0
+            self.assertAlmostEqual(float(arr_pil[0, 1, 0, 0]), -1.0, places=3)  # G=0 -> -1.0
+
+            arr_cv2 = decode_image_cv2_for_wd14(img_path, target_size=448, target_dtype=np.float32, nchw=True, preprocess_mode="pixai")
+            self.assertIsNotNone(arr_cv2)
+            self.assertEqual(arr_cv2.shape, (1, 3, 448, 448))
+            self.assertTrue(np.allclose(arr_pil, arr_cv2, atol=1e-2))
+        finally:
+            for p in (csv_path, img_path):
+                if os.path.exists(p):
+                    try: os.remove(p)
+                    except OSError: pass
+
+    def test_12_camie_v2_json_metadata_and_preprocess(self):
+        import json
+        from workers import decode_image_cv2_for_wd14
+
+        fd, json_path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        fd_img, img_path = tempfile.mkstemp(suffix=".png")
+        os.close(fd_img)
+        try:
+            mock_meta = {
+                "model_info": {"img_size": 512},
+                "dataset_info": {
+                    "total_tags": 5,
+                    "tag_mapping": {
+                        "idx_to_tag": {
+                            "0": "year_2025",
+                            "1": "hatsune_miku",
+                            "2": "vocaloid",
+                            "3": "twintails",
+                            "4": "rating_sensitive"
+                        },
+                        "tag_to_category": {
+                            "year_2025": "year",
+                            "hatsune_miku": "character",
+                            "vocaloid": "copyright",
+                            "twintails": "general",
+                            "rating_sensitive": "rating"
+                        }
+                    }
+                }
+            }
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(mock_meta, f)
+
+            tagger = WD14Tagger(model_key="camie-tagger-v2", tags_path=json_path, use_gpu=False)
+            tagger.load_tags()
+            self.assertEqual(len(tagger.tags_data), 5)
+            self.assertEqual(tagger.char_indices, [1])
+            self.assertEqual(tagger.series_indices, [2])
+            self.assertEqual(tagger.general_indices, [3])
+            self.assertEqual(tagger.rating_indices, [4])
+            self.assertEqual(tagger.tags_data[4]["name"], "sensitive")
+
+            # Raw logits (Camie v2 outputs unactivated logits) -> sigmoid applied automatically
+            raw_logits = np.array([5.0, 4.0, 3.0, 2.0, 3.5], dtype=np.float32)
+            res = tagger._extract_tags_from_probs(raw_logits, char_threshold=0.35, gen_threshold=0.35)
+            self.assertEqual(res["characters"][0][0], "hatsune_miku")
+            self.assertEqual(res["series"][0][0], "vocaloid")
+            self.assertEqual(res["general"][0][0], "twintails")
+            self.assertEqual(res["rating"], "sensitive")
+            # Ensure 'year_2025' (category -1) is NOT leaked into general/characters/series
+            all_names = [t[0] for t in res["all_tags"]]
+            self.assertNotIn("year_2025", all_names)
+
+            # Verify PIL & OpenCV preprocessing match NCHW [1, 3, 512, 512] ImageNet normalized
+            img = Image.new("RGB", (512, 512), (255, 255, 255))
+            img.save(img_path)
+            arr_pil = tagger.preprocess_image(img, target_size=512)
+            self.assertEqual(arr_pil.shape, (1, 3, 512, 512))
+            self.assertAlmostEqual(float(arr_pil[0, 0, 0, 0]), (1.0 - 0.485) / 0.229, places=3)
+
+            arr_cv2 = decode_image_cv2_for_wd14(img_path, target_size=512, target_dtype=np.float32, nchw=True, preprocess_mode="camie")
+            self.assertIsNotNone(arr_cv2)
+            self.assertEqual(arr_cv2.shape, (1, 3, 512, 512))
+            self.assertTrue(np.allclose(arr_pil, arr_cv2, atol=1e-2))
+        finally:
+            for p in (json_path, img_path):
+                if os.path.exists(p):
+                    try: os.remove(p)
+                    except OSError: pass
 
     def test_10_ensemble_registry_and_check(self):
         from tagger import get_model_paths, WD14Tagger

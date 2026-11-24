@@ -178,7 +178,7 @@ DEFAULT_TAGS_CSV = os.path.join(AI_MODELS_DIR, "selected_tags.csv")
 DEFAULT_CHARACTER_THRESHOLD = 0.35
 DEFAULT_GENERAL_THRESHOLD = 0.35
 
-# Hugging Face Model Registry (WD14 & WD v3 Series)
+# Hugging Face Model Registry (WD14, WD v3, PixAI & Camie Series)
 AVAILABLE_AI_MODELS = {
     "wd-v1-4-convnext-v2": {
         "id": "wd-v1-4-convnext-v2",
@@ -188,16 +188,22 @@ AVAILABLE_AI_MODELS = {
         "model_url": "https://huggingface.co/SmilingWolf/wd-v1-4-convnextv2-tagger-v2/resolve/main/model.onnx",
         "tags_url": "https://huggingface.co/SmilingWolf/wd-v1-4-convnextv2-tagger-v2/resolve/main/selected_tags.csv",
         "subdir": "",
+        "size_hint": "~370 MB",
+        "preprocess_mode": "wd",
+        "input_size": 448,
         "legacy": True
     },
     "wd-v3-convnext": {
         "id": "wd-v3-convnext",
-        "name": "⭐ WD Tagger v3 - ConvNeXt (~10,000+ แท็ก / แนะนำ 🔥)",
+        "name": "⭐ WD Tagger v3 - ConvNeXt (~10,800+ แท็ก / แนะนำ 🔥)",
         "short_name": "WD v3 ConvNeXt",
         "repo": "SmilingWolf/wd-convnext-tagger-v3",
         "model_url": "https://huggingface.co/SmilingWolf/wd-convnext-tagger-v3/resolve/main/model.onnx",
         "tags_url": "https://huggingface.co/SmilingWolf/wd-convnext-tagger-v3/resolve/main/selected_tags.csv",
         "subdir": "wd_v3_convnext",
+        "size_hint": "~377 MB",
+        "preprocess_mode": "wd",
+        "input_size": 448,
         "legacy": False
     },
     "wd-v3-vit": {
@@ -208,6 +214,9 @@ AVAILABLE_AI_MODELS = {
         "model_url": "https://huggingface.co/SmilingWolf/wd-vit-tagger-v3/resolve/main/model.onnx",
         "tags_url": "https://huggingface.co/SmilingWolf/wd-vit-tagger-v3/resolve/main/selected_tags.csv",
         "subdir": "wd_v3_vit",
+        "size_hint": "~361 MB",
+        "preprocess_mode": "wd",
+        "input_size": 448,
         "legacy": False
     },
     "wd-v3-swinv2": {
@@ -218,6 +227,9 @@ AVAILABLE_AI_MODELS = {
         "model_url": "https://huggingface.co/SmilingWolf/wd-swinv2-tagger-v3/resolve/main/model.onnx",
         "tags_url": "https://huggingface.co/SmilingWolf/wd-swinv2-tagger-v3/resolve/main/selected_tags.csv",
         "subdir": "wd_v3_swinv2",
+        "size_hint": "~446 MB",
+        "preprocess_mode": "wd",
+        "input_size": 448,
         "legacy": False
     },
     "wd-v3-eva02-large": {
@@ -228,6 +240,9 @@ AVAILABLE_AI_MODELS = {
         "model_url": "https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3/resolve/main/model.onnx",
         "tags_url": "https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3/resolve/main/selected_tags.csv",
         "subdir": "wd_v3_eva02_large",
+        "size_hint": "~1.2 GB",
+        "preprocess_mode": "wd",
+        "input_size": 448,
         "legacy": False
     },
     "wd-v3-vit-large": {
@@ -238,6 +253,38 @@ AVAILABLE_AI_MODELS = {
         "model_url": "https://huggingface.co/SmilingWolf/wd-vit-large-tagger-v3/resolve/main/model.onnx",
         "tags_url": "https://huggingface.co/SmilingWolf/wd-vit-large-tagger-v3/resolve/main/selected_tags.csv",
         "subdir": "wd_v3_vit_large",
+        "size_hint": "~1.2 GB",
+        "preprocess_mode": "wd",
+        "input_size": 448,
+        "legacy": False
+    },
+    "pixai-tagger-v0.9": {
+        "id": "pixai-tagger-v0.9",
+        "name": "🔥 PixAI Tagger v0.9 (13,461 แท็ก + ผูก Series อัตโนมัติ / ตัวละครใหม่แม่นมาก)",
+        "short_name": "PixAI Tagger v0.9",
+        "repo": "deepghs/pixai-tagger-v0.9-onnx",
+        "model_url": "https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx/resolve/main/model.onnx",
+        "tags_url": "https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx/resolve/main/selected_tags.csv",
+        "tags_filename": "selected_tags.csv",
+        "subdir": "pixai_tagger_v0_9",
+        "size_hint": "~1.2 GB",
+        "preprocess_mode": "pixai",
+        "input_size": 448,
+        "legacy": False
+    },
+    "camie-tagger-v2": {
+        "id": "camie-tagger-v2",
+        "name": "🌟 Camie Tagger v2 (70,527 แท็ก / ละเอียดสุดขีด สาย LoRA & Illustrious)",
+        "short_name": "Camie Tagger v2",
+        "repo": "Camais03/camie-tagger-v2",
+        "model_url": "https://huggingface.co/Camais03/camie-tagger-v2/resolve/main/camie-tagger-v2.onnx",
+        "tags_url": "https://huggingface.co/Camais03/camie-tagger-v2/resolve/main/camie-tagger-v2-metadata.json",
+        "tags_filename": "camie-tagger-v2-metadata.json",
+        "subdir": "camie_tagger_v2",
+        "size_hint": "~755 MB",
+        "preprocess_mode": "camie",
+        "input_size": 512,
+        "output_index": 1,
         "legacy": False
     },
     "wd-v3-ensemble": {
@@ -248,6 +295,7 @@ AVAILABLE_AI_MODELS = {
         "model_url": "",
         "tags_url": "",
         "subdir": "wd_v3_ensemble",
+        "size_hint": "~1.2 GB",
         "is_ensemble": True,
         "ensemble_keys": ["wd-v3-convnext", "wd-v3-vit", "wd-v3-swinv2"],
         "legacy": False
@@ -260,6 +308,7 @@ AVAILABLE_AI_MODELS = {
         "model_url": "",
         "tags_url": "",
         "subdir": "wd_v3_ultra_ensemble",
+        "size_hint": "~2.0 GB",
         "is_ensemble": True,
         "ensemble_keys": ["wd-v3-eva02-large", "wd-v3-swinv2", "wd-v3-convnext"],
         "legacy": False
