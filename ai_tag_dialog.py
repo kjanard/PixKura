@@ -22,9 +22,10 @@ class ModelDownloadThread(QThread):
     progress = pyqtSignal(int, int, str)
     finished = pyqtSignal(bool, str)
 
-    def __init__(self, model_key=DEFAULT_MODEL_KEY, parent=None):
+    def __init__(self, model_key=DEFAULT_MODEL_KEY, parent=None, force_redownload=False):
         super().__init__(parent)
         self.model_key = model_key
+        self.force_redownload = force_redownload
         self.cancelled = False
 
     def cancel(self):
@@ -35,7 +36,8 @@ class ModelDownloadThread(QThread):
             WD14Tagger.download_models(
                 model_key=self.model_key,
                 progress_callback=lambda d, t, m: self.progress.emit(d, t, m),
-                cancel_check=lambda: self.cancelled
+                cancel_check=lambda: self.cancelled,
+                force_redownload=self.force_redownload
             )
             self.finished.emit(True, "ดาวน์โหลดโมเดล AI สำเร็จเรียบร้อยแล้ว!")
         except Exception as e:
@@ -488,6 +490,7 @@ class AiTagDialog(MinimizableDialog):
                 self.model_status_label.setText(f"⚠️ ยังไม่ได้ดาวน์โหลด {model_name} (กดดาวน์โหลดก่อนใช้งาน)")
                 self.btn_download_model.setText(f"📥 ดาวน์โหลด {model_name} ({size_hint})")
             self.model_status_label.setStyleSheet("color: #f59e0b; font-weight: bold;")
+            self.btn_download_model.setEnabled(True)
             self.btn_download_model.setVisible(True)
             self.btn_start.setEnabled(False)
 
@@ -566,12 +569,12 @@ class AiTagDialog(MinimizableDialog):
             msg = f"มีโมเดล {model_name} เวอร์ชันใหม่บน Hugging Face (ขนาด {remote_sz/(1024*1024):.1f} MB vs ในเครื่อง {local_sz/(1024*1024):.1f} MB)\nคุณต้องการดาวน์โหลดอัปเดตใหม่หรือไม่?"
             ret = QMessageBox.question(self, "พบการอัปเดตโมเดล", msg, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if ret == QMessageBox.StandardButton.Yes:
-                self.start_download_model()
+                self.start_download_model(force_redownload=True)
         else:
             self.log_text.append(f"✅ โมเดล {model_name} ในเครื่องเป็นเวอร์ชันล่าสุดแล้ว")
             QMessageBox.information(self, "โมเดลเวอร์ชันล่าสุด", f"✅ โมเดล {model_name} ในเครื่องเป็นเวอร์ชันล่าสุดเรียบร้อยแล้วครับ")
 
-    def start_download_model(self):
+    def start_download_model(self, force_redownload=False):
         model_key = self.combo_model.currentData() or DEFAULT_MODEL_KEY
         model_name = AVAILABLE_AI_MODELS.get(model_key, {}).get("short_name", model_key)
         self.btn_download_model.setEnabled(False)
@@ -580,7 +583,11 @@ class AiTagDialog(MinimizableDialog):
         self.progress_bar.setValue(0)
         self.log_text.append(f"📥 เริ่มต้นการดาวน์โหลดโมเดล {model_name} จาก Hugging Face...")
 
-        self.download_thread = ModelDownloadThread(model_key=model_key, parent=self)
+        self.download_thread = ModelDownloadThread(
+            model_key=model_key,
+            parent=self,
+            force_redownload=bool(force_redownload)
+        )
         self.download_thread.progress.connect(self.on_download_progress)
         self.download_thread.finished.connect(self.on_download_finished)
         self.download_thread.start()
@@ -594,13 +601,13 @@ class AiTagDialog(MinimizableDialog):
 
     def on_download_finished(self, success, msg):
         self.combo_model.setEnabled(True)
+        self.btn_download_model.setEnabled(True)
         if success:
             self.on_model_changed(self.combo_model.currentIndex())
             self.progress_bar.setValue(100)
             self.log_text.append(f"🎉 {msg}")
             QMessageBox.information(self, "ดาวน์โหลดสำเร็จ", f"{msg}\nโมเดลพร้อมใช้งานทันทีครับ")
         else:
-            self.btn_download_model.setEnabled(True)
             self.log_text.append(f"❌ ดาวน์โหลดล้มเหลว: {msg}")
             QMessageBox.critical(self, "เกิดข้อผิดพลาด", f"ไม่สามารถดาวน์โหลดโมเดลได้:\n{msg}")
 
@@ -787,6 +794,9 @@ class AiTagDialog(MinimizableDialog):
 
     def closeEvent(self, event):
         self.timer_stopwatch.stop()
+        if self.download_thread and self.download_thread.isRunning():
+            self.download_thread.cancel()
+            self.download_thread.wait(1000)
         if self.worker and self.worker.running:
             reply = QMessageBox.question(
                 self, "ยืนยันการปิดหน้าต่าง",

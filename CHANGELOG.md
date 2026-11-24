@@ -4,6 +4,25 @@ All notable changes to the PixKura project will be documented in this file.
 
 ---
 
+## [Unreleased / Post-v2.4.0] - 2026-11-24
+
+### Added (Next-Gen Community Tagger Models & Heterogeneous 3-in-1 Ensemble)
+* **🔥 PixAI Tagger v0.9 (`deepghs/pixai-tagger-v0.9-onnx`) (`config.py`, `tagger.py`, `workers.py`)**:
+  * Added PixAI's 13,461-tag anime tagger with RGB `[-1, 1]` NCHW preprocessing, dynamic header-based CSV parsing, **automatic Character → Series/IP mapping** via the `ips` column, and smart SFW/NSFW rating inference.
+  * Automatically prunes unused `embedding` / `logits` ONNX outputs during FP16 conversion so DirectML GPU runs at full speed (~3.8 FPS, 606 MB) without falling back to CPU, with official `min_char_threshold = 0.85` calibration.
+* **🌟 Camie Tagger v2 (`Camais03/camie-tagger-v2`) (`config.py`, `tagger.py`, `workers.py`)**:
+  * Added Camie Tagger v2 supporting **70,527 tags** via JSON metadata (`camie-tagger-v2-metadata.json`), 512×512 ImageNet-normalized NCHW preprocessing, `refined_predictions` cross-attention output selection, normalized ratings (`rating_sensitive` → `sensitive`), and `min_char_threshold = 0.50` calibration (~14.9 FPS on RX 6800 DirectML).
+* **🌌 All Best Model in One (`all-best-ensemble`) (`config.py`, `tagger.py`, `workers.py`, `ai_tag_dialog.py`)**:
+  * Added heterogeneous 3-in-1 ensemble combining `WD v3 EVA02-Large` + `PixAI Tagger v0.9` + `Camie Tagger v2` using single-decode OpenCV multi-tensor generation (`decode_image_cv2_multi`), cross-vocabulary Union + Consensus Boost fusion, explicit rating head priority, and automatic VRAM micro-batch capping (`Batch <= 4`) to prevent Shared RAM spillover.
+
+### Fixed & Optimized
+* **Comprehensive Memory / Handle / Socket Leak Hardening (`download_dialog.py`, `ai_tag_dialog.py`, `lightbox_viewer.py`, `components.py`, `database.py`, `danbooru_api.py`, `tagger.py`, `workers.py`)**:
+  * Added `WA_DeleteOnClose` on `MinimizableDialog`, capped log buffers to 2,000 blocks in `PixivDownloadDialog` and `AiTagDialog`, added `_cleanup_resources()` in `LightboxViewerDialog`, `WD14Tagger.unload()`, `requests.Session` HTTP pooling, and `try/finally` SQLite/HTTP/PIL cleanup across the codebase.
+* **AI Model Updater & Post-Processing Polish (`tagger.py`, `ai_tag_dialog.py`)**:
+  * Fixed `force_redownload` flow when confirming a Hugging Face model update, fixed `btn_download_model` staying disabled after switching models post-download, closed `requests.head` handles cleanly, cancelled active download threads on dialog close, and removed redundant `0.20` threshold floor in `_extract_tags_from_probs` (~5× faster post-processing on 70k-tag models).
+
+---
+
 ## [Version 2.4.0-V.32] - 2026-11-02
 
 ### Added (Security Hardening, Native `.mp4` Ugoira, Favorites, Duplicate Finder & Dataset Exporter)

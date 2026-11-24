@@ -244,6 +244,7 @@ class WD14Tagger:
         local_model_path = paths["model_fp32"]
         if not os.path.exists(local_model_path):
             return True, 0, 0
+        resp = None
         try:
             resp = requests.head(model_url, timeout=10, allow_redirects=True)
             if resp.status_code == 200:
@@ -253,14 +254,20 @@ class WD14Tagger:
                 return has_update, remote_size, local_size
         except Exception as e:
             logging.warning(f"Failed to check model updates from Hugging Face: {e}")
+        finally:
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
         return False, 0, 0
 
     @classmethod
-    def download_models(cls, model_key=DEFAULT_MODEL_KEY, progress_callback=None, cancel_check=None):
+    def download_models(cls, model_key=DEFAULT_MODEL_KEY, progress_callback=None, cancel_check=None, force_redownload=False):
         """
-        Downloads ONNX model and tags CSV from Hugging Face repository for the chosen model_key.
+        Downloads ONNX model and tags CSV/JSON from Hugging Face repository for the chosen model_key.
         Automatically applies dynamic batch size patch and creates FP16 version.
-        Supports ensemble models by sequentially downloading missing sub-models.
+        Supports ensemble models by sequentially downloading missing (or outdated) sub-models.
         """
         paths = get_model_paths(model_key)
         meta = paths["meta"]
@@ -269,11 +276,16 @@ class WD14Tagger:
             ensemble_keys = meta.get("ensemble_keys", [])
             for idx, sub_key in enumerate(ensemble_keys):
                 sub_meta = AVAILABLE_AI_MODELS[sub_key]
-                if not cls.is_model_installed(sub_key):
+                if force_redownload or not cls.is_model_installed(sub_key):
                     def sub_cb(cur, tot, msg, i=idx, n=len(ensemble_keys), sm=sub_meta):
                         if progress_callback:
                             progress_callback(cur, tot, f"[{i+1}/{n}] {msg}")
-                    cls.download_models(sub_key, progress_callback=sub_cb, cancel_check=cancel_check)
+                    cls.download_models(
+                        sub_key,
+                        progress_callback=sub_cb,
+                        cancel_check=cancel_check,
+                        force_redownload=force_redownload
+                    )
             return True
 
         target_dir = paths["dir"]
@@ -288,7 +300,7 @@ class WD14Tagger:
         for filename, url, dest_path in files:
             temp_path = dest_path + ".download"
 
-            if os.path.exists(dest_path) and os.path.getsize(dest_path) > 1024 * 1024:
+            if not force_redownload and os.path.exists(dest_path) and os.path.getsize(dest_path) > 1024 * 1024:
                 continue
 
             resp = requests.get(url, stream=True, timeout=30)
@@ -834,7 +846,7 @@ class WD14Tagger:
         effective_char_thresh = max(char_threshold, self.min_char_threshold)
         effective_gen_thresh = max(gen_threshold, self.min_gen_threshold)
 
-        min_thresh = min(effective_char_thresh, effective_gen_thresh, 0.20)
+        min_thresh = min(effective_char_thresh, effective_gen_thresh)
         passing_indices = np.flatnonzero(probs >= min_thresh)
         num_tags = len(self.tags_data)
 

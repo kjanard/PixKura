@@ -213,8 +213,11 @@ class TestQueryParser(unittest.TestCase):
         if not os.path.exists(DB_FILE):
             self.skipTest("Database file not found.")
 
-        conn = sqlite3.connect(DB_FILE)
+        conn = sqlite3.connect(DB_FILE, timeout=15.0)
         try:
+            # Pin a single consistent WAL read snapshot so concurrent background AI tagging
+            # writes cannot mutate ratings between the SFW and NSFW queries.
+            conn.execute("BEGIN DEFERRED")
             # Test SFW resolution
             q_sfw = parse_search_query("rating:sfw")
             sfw_paths = resolve_matching_paths(conn, q_sfw)
@@ -238,6 +241,10 @@ class TestQueryParser(unittest.TestCase):
             self.assertTrue(char_paths.issubset(sfw_paths))
 
         finally:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
             conn.close()
 
 if __name__ == "__main__":
