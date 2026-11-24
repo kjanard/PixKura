@@ -181,6 +181,11 @@ class TestWD14Tagger(unittest.TestCase):
             self.assertIn("fate/stay_night", series_names)
             self.assertEqual(res["rating"], "general")
 
+            # Verify PixAI official character threshold calibration (0.85 floor blocks 0.60 false positives)
+            probs_fp = np.array([0.95, 0.10, 0.60], dtype=np.float32)
+            res_fp = tagger._extract_tags_from_probs(probs_fp, char_threshold=0.35, gen_threshold=0.35)
+            self.assertEqual(res_fp["characters"], [])
+
             # Verify explicit rating fallback when NSFW general tag fires
             probs_nsfw = np.array([0.95, 0.90, 0.10], dtype=np.float32)
             res_nsfw = tagger._extract_tags_from_probs(probs_nsfw, char_threshold=0.35, gen_threshold=0.35)

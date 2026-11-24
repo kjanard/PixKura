@@ -79,6 +79,9 @@ class WD14Tagger:
         self.ensemble_keys = self.meta.get("ensemble_keys", [])
         self.preprocess_mode = self.meta.get("preprocess_mode", "wd")
         self.output_index = int(self.meta.get("output_index", 0))
+        self.preferred_output_name = self.meta.get("output_name", None)
+        self.min_char_threshold = float(self.meta.get("min_char_threshold", 0.0))
+        self.min_gen_threshold = float(self.meta.get("min_gen_threshold", 0.0))
         self.default_input_size = int(self.meta.get("input_size", 448))
         self.has_ips_mapping = False
         self.sub_taggers = []
@@ -153,8 +156,13 @@ class WD14Tagger:
         return model_installed and tags_installed
 
     @staticmethod
-    def convert_to_fp16(src_path, dst_path):
-        """Converts FP32 ONNX model to FP16 half-precision with dynamic batch size for GPU acceleration."""
+    def convert_to_fp16(src_path, dst_path, preferred_output_name=None, prune_outputs=False):
+        """
+        Converts FP32 ONNX model to FP16 half-precision with dynamic batch size for GPU acceleration.
+        Optionally prunes unused intermediate outputs (e.g. PixAI 'embedding'/'logits') so DirectML
+        ORT_ENABLE_ALL graph optimizations succeed without falling back to CPU.
+        """
+        import warnings
         logging.info(f"Converting {src_path} to FP16 half-precision -> {dst_path}...")
         try:
             model = onnx.load(src_path)
@@ -176,18 +184,38 @@ class WD14Tagger:
             except Exception as e:
                 logging.debug(f"Dynamic batch patch on source: {e}")
 
-            model_fp16 = float16.convert_float_to_float16(
-                model,
-                keep_io_types=False,
-                op_block_list=['ReduceSumSquare', 'Sqrt', 'Div', 'ReduceMean', 'GlobalAveragePool']
-            )
-            onnx.save(model_fp16, dst_path)
+            # Prune unused outputs on the FP16 copy when requested (fixes PixAI DirectML EP error)
+            if prune_outputs and preferred_output_name:
+                kept = [o for o in model.graph.output if o.name == preferred_output_name]
+                if kept:
+                    del model.graph.output[:]
+                    model.graph.output.extend(kept)
 
-            # Verify the converted model can actually be loaded by ONNXRuntime
-            sess_test = ort.InferenceSession(dst_path, providers=['CPUExecutionProvider'])
-            del sess_test
-            logging.info(f"Saved and verified FP16 model successfully: {dst_path}")
-            return dst_path
+            block_list = ['ReduceSumSquare', 'Sqrt', 'Div', 'ReduceMean', 'GlobalAveragePool']
+            for keep_io in (False, True) if not prune_outputs else (True,):
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        model_fp16 = float16.convert_float_to_float16(
+                            model,
+                            keep_io_types=keep_io,
+                            op_block_list=block_list
+                        )
+                    onnx.save(model_fp16, dst_path)
+
+                    # Verify the converted model can actually be loaded by ONNXRuntime
+                    so = ort.SessionOptions()
+                    so.log_severity_level = 3
+                    sess_test = ort.InferenceSession(dst_path, sess_options=so, providers=['CPUExecutionProvider'])
+                    del sess_test
+                    logging.info(f"Saved and verified FP16 model successfully (keep_io_types={keep_io}): {dst_path}")
+                    return dst_path
+                except Exception as inner_e:
+                    logging.debug(f"FP16 attempt (keep_io_types={keep_io}) failed: {inner_e}")
+                    if os.path.exists(dst_path):
+                        try: os.remove(dst_path)
+                        except Exception: pass
+            return None
         except Exception as e:
             logging.warning(f"FP16 conversion not compatible with this model architecture ({e}). Keeping FP32 model.")
             if os.path.exists(dst_path):
@@ -304,7 +332,12 @@ class WD14Tagger:
             if os.path.exists(paths["model_fp32"]):
                 if progress_callback:
                     progress_callback(100, 100, f"กำลังแปลง {meta['short_name']} เป็น FP16 DirectML...")
-                cls.convert_to_fp16(paths["model_fp32"], paths["model_fp16"])
+                cls.convert_to_fp16(
+                    paths["model_fp32"],
+                    paths["model_fp16"],
+                    preferred_output_name=meta.get("output_name"),
+                    prune_outputs=bool(meta.get("prune_fp16_output", False))
+                )
         except Exception as e:
             logging.warning(f"Auto FP16 conversion failed: {e}")
 
@@ -467,43 +500,79 @@ class WD14Tagger:
         
         providers.append('CPUExecutionProvider')
 
-        sess_options = ort.SessionOptions()
-        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        sess_options.enable_mem_pattern = True
-        sess_options.enable_cpu_mem_arena = True
-        sess_options.log_severity_level = 3
+        def _select_output_name(sess):
+            outputs = sess.get_outputs()
+            if self.preferred_output_name:
+                for o in outputs:
+                    if o.name == self.preferred_output_name:
+                        return o.name
+            out_idx = self.output_index if self.output_index < len(outputs) else 0
+            return outputs[out_idx].name
 
-        # 1. Try loading FP16 model first if requested
-        if self.use_fp16 and paths["model_fp16"] and os.path.exists(paths["model_fp16"]):
-            try:
-                self.session = ort.InferenceSession(paths["model_fp16"], sess_options=sess_options, providers=providers)
-                self.active_provider = self.session.get_providers()[0]
-                inputs = self.session.get_inputs()
-                outputs = self.session.get_outputs()
-                out_idx = self.output_index if self.output_index < len(outputs) else 0
-                self.input_name = inputs[0].name
-                self.input_shape = inputs[0].shape
-                self.input_dtype = np.float16 if "float16" in inputs[0].type else np.float32
-                self.output_name = outputs[out_idx].name
-                logging.info(f"Initialized WD14Tagger on {self.active_provider} (FP16). Input: {self.input_name} {self.input_shape} ({self.input_dtype}) -> Output: {self.output_name}")
-                return
-            except Exception as e:
-                logging.warning(f"FP16 load failed for {self.model_key} ({e}), falling back to FP32 DirectML...")
+        def _create_session(model_file):
+            so = ort.SessionOptions()
+            so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+            so.enable_mem_pattern = False if 'DmlExecutionProvider' in providers else True
+            so.enable_cpu_mem_arena = True
+            so.log_severity_level = 3
+            sess = ort.InferenceSession(model_file, sess_options=so, providers=providers)
+            # If GPU was requested but DirectML fell back to CPU due to ORT_ENABLE_ALL graph fusion
+            # (e.g. PixAI unpruned FP32 'logits' output), retry with ORT_ENABLE_BASIC to keep it on GPU!
+            if self.use_gpu and 'DmlExecutionProvider' in providers and sess.get_providers()[0] == 'CPUExecutionProvider':
+                try:
+                    so_basic = ort.SessionOptions()
+                    so_basic.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+                    so_basic.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+                    so_basic.enable_mem_pattern = False
+                    so_basic.enable_cpu_mem_arena = True
+                    so_basic.log_severity_level = 3
+                    sess_basic = ort.InferenceSession(model_file, sess_options=so_basic, providers=providers)
+                    if sess_basic.get_providers()[0] != 'CPUExecutionProvider':
+                        del sess
+                        return sess_basic
+                    del sess_basic
+                except Exception:
+                    pass
+            return sess
+
+        # 1. Try loading FP16 model first if requested (auto-convert once if prune_fp16_output is supported)
+        if self.use_fp16 and paths["model_fp16"]:
+            if not os.path.exists(paths["model_fp16"]) and self.meta.get("prune_fp16_output") and os.path.exists(paths["model_fp32"]):
+                try:
+                    self.convert_to_fp16(
+                        paths["model_fp32"],
+                        paths["model_fp16"],
+                        preferred_output_name=self.preferred_output_name,
+                        prune_outputs=True
+                    )
+                except Exception:
+                    pass
+            if os.path.exists(paths["model_fp16"]):
+                try:
+                    self.session = _create_session(paths["model_fp16"])
+                    self.active_provider = self.session.get_providers()[0]
+                    inputs = self.session.get_inputs()
+                    self.input_name = inputs[0].name
+                    self.input_shape = inputs[0].shape
+                    self.input_dtype = np.float16 if "float16" in inputs[0].type else np.float32
+                    self.output_name = _select_output_name(self.session)
+                    logging.info(f"Initialized WD14Tagger on {self.active_provider} (FP16). Input: {self.input_name} {self.input_shape} ({self.input_dtype}) -> Output: {self.output_name}")
+                    return
+                except Exception as e:
+                    logging.warning(f"FP16 load failed for {self.model_key} ({e}), falling back to FP32 DirectML...")
 
         # 2. Fallback to FP32 model
         if not os.path.exists(paths["model_fp32"]):
             raise FileNotFoundError(f"ไม่พบไฟล์โมเดล AI: {paths['model_fp32']}")
 
-        self.session = ort.InferenceSession(paths["model_fp32"], sess_options=sess_options, providers=providers)
+        self.session = _create_session(paths["model_fp32"])
         self.active_provider = self.session.get_providers()[0]
         inputs = self.session.get_inputs()
-        outputs = self.session.get_outputs()
-        out_idx = self.output_index if self.output_index < len(outputs) else 0
         self.input_name = inputs[0].name
         self.input_shape = inputs[0].shape
         self.input_dtype = np.float16 if "float16" in inputs[0].type else np.float32
-        self.output_name = outputs[out_idx].name
+        self.output_name = _select_output_name(self.session)
         logging.info(f"Initialized WD14Tagger on {self.active_provider} (FP32). Input: {self.input_name} {self.input_shape} ({self.input_dtype}) -> Output: {self.output_name}")
 
     def unload(self):
@@ -762,7 +831,10 @@ class WD14Tagger:
         seen_series = {}
         inferred_series = {}
 
-        min_thresh = min(char_threshold, gen_threshold, 0.20)
+        effective_char_thresh = max(char_threshold, self.min_char_threshold)
+        effective_gen_thresh = max(gen_threshold, self.min_gen_threshold)
+
+        min_thresh = min(effective_char_thresh, effective_gen_thresh, 0.20)
         passing_indices = np.flatnonzero(probs >= min_thresh)
         num_tags = len(self.tags_data)
 
@@ -774,19 +846,19 @@ class WD14Tagger:
             conf = float(probs[idx])
             name = tag_info["name"]
 
-            if cat == 4 and conf >= char_threshold:
+            if cat == 4 and conf >= effective_char_thresh:
                 characters.append((name, conf))
                 all_tags.append((name, 4, conf))
                 # Automatic Character -> Series/IP mapping (e.g. PixAI Tagger v0.9 `ips` column)
                 for ip_name in tag_info.get("ips", ()):
                     if ip_name and conf > inferred_series.get(ip_name, 0.0):
                         inferred_series[ip_name] = conf
-            elif cat == 3 and conf >= char_threshold:
+            elif cat == 3 and conf >= effective_char_thresh:
                 if conf > seen_series.get(name, 0.0):
                     seen_series[name] = conf
                 series.append((name, conf))
                 all_tags.append((name, 3, conf))
-            elif cat == 0 and conf >= gen_threshold:
+            elif cat == 0 and conf >= effective_gen_thresh:
                 general.append((name, conf))
                 all_tags.append((name, 0, conf))
 

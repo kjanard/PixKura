@@ -2262,12 +2262,14 @@ class AiTaggingWorker(QRunnable):
         else:
             num_prefetchers = min(16, max(8, (os.cpu_count() or 8) * 2))
 
-        INFERENCE_BATCH = self.inference_batch
+        # Auto-cap effective batch size for heterogeneous 3-model ensemble to prevent VRAM spillover into Shared RAM
+        is_heterogeneous = getattr(tagger, "is_heterogeneous", False)
+        INFERENCE_BATCH = min(self.inference_batch, 4) if is_heterogeneous else self.inference_batch
 
         _safe_emit(
             self.signals.log,
             f"🚀 เริ่มการสแกน Turbo Batch Pipeline ทั้งหมด {total_files:,} ไฟล์ "
-            f"(GPU Batch={INFERENCE_BATCH} | Storage: {profile_label} [{num_prefetchers} I/O Threads])..."
+            f"(GPU Batch={INFERENCE_BATCH}{' [Auto-VRAM Cap สำหรับ 3 ค่าย]' if is_heterogeneous and self.inference_batch > 4 else ''} | Storage: {profile_label} [{num_prefetchers} I/O Threads])..."
         )
 
         start_time = time.time()
@@ -2276,7 +2278,6 @@ class AiTaggingWorker(QRunnable):
         batch_tags = []
 
         # Determine model input size, dtype, preprocess_mode, and NCHW flag dynamically
-        is_heterogeneous = getattr(tagger, "is_heterogeneous", False)
         sub_specs = tagger.get_sub_preprocess_specs() if is_heterogeneous else []
         preprocess_mode = getattr(tagger, "preprocess_mode", "wd")
         target_size = getattr(tagger, "default_input_size", 448)
@@ -2291,7 +2292,7 @@ class AiTaggingWorker(QRunnable):
         target_dtype = tagger.input_dtype
 
         # Multi-threaded Producer-Consumer Prefetch Pipeline
-        prefetch_queue = queue.Queue(maxsize=INFERENCE_BATCH * (4 if is_heterogeneous else 8))
+        prefetch_queue = queue.Queue(maxsize=INFERENCE_BATCH * (2 if is_heterogeneous else 8))
         idx_queue = queue.Queue()
         for idx, fp in enumerate(target_files):
             idx_queue.put((idx, fp))

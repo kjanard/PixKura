@@ -270,6 +270,10 @@ AVAILABLE_AI_MODELS = {
         "size_hint": "~1.2 GB",
         "preprocess_mode": "pixai",
         "input_size": 448,
+        "output_index": 2,
+        "output_name": "prediction",
+        "prune_fp16_output": True,
+        "min_char_threshold": 0.85,
         "legacy": False
     },
     "camie-tagger-v2": {
@@ -285,6 +289,9 @@ AVAILABLE_AI_MODELS = {
         "preprocess_mode": "camie",
         "input_size": 512,
         "output_index": 1,
+        "output_name": "refined_predictions",
+        "min_char_threshold": 0.50,
+        "min_gen_threshold": 0.45,
         "legacy": False
     },
     "wd-v3-ensemble": {
